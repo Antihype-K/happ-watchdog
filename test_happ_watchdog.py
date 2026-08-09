@@ -343,6 +343,133 @@ class SessionEnvironment(unittest.TestCase):
         self.assertNotEqual(env.get("XAUTHORITY"), str(self.runtime / "нет-такого"))
 
 
+SAMPLE_HAPP_CONF = """\
+[General]
+lang=ru
+
+[Preferences]
+AdvancedSettings\\tun=true
+AdvancedSettings\\tunDnsEnable=true
+PingSettings\\pingTestUrl=https://cp.cloudflare.com/generate_204
+
+[Vacancy]
+seen=1
+"""
+
+
+class HappSettingsHealing(unittest.TestCase):
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.dir = Path(tempfile.mkdtemp())
+        self.conf = self.dir / "Happ.conf"
+        self.conf.write_text(SAMPLE_HAPP_CONF, encoding="utf-8")
+        self.saved = (w.HAPP_SETTINGS_PATH, w.HAPP_SETTINGS_BACKUP)
+        w.HAPP_SETTINGS_PATH = self.conf
+        w.HAPP_SETTINGS_BACKUP = self.dir / "Happ.conf.bak"
+
+    def tearDown(self):
+        w.HAPP_SETTINGS_PATH, w.HAPP_SETTINGS_BACKUP = self.saved
+
+    def test_reads_only_preferences_section(self):
+        values = w.read_happ_settings()
+        self.assertEqual(values["AdvancedSettings\\tunDnsEnable"], "true")
+        self.assertNotIn("lang", values)          # [General] — чужая секция
+        self.assertNotIn("seen", values)
+
+    def test_problems_list_names_current_values(self):
+        problems = w.happ_settings_problems(self.cfg)
+        self.assertTrue(any("tunDnsEnable=false (сейчас true)" in p for p in problems))
+        self.assertTrue(any("xrayCoreLogLevel=info (сейчас не задано)" in p for p in problems))
+
+    def test_existing_key_is_corrected_and_missing_one_added(self):
+        w.apply_happ_settings(w.desired_happ_settings(self.cfg))
+        values = w.read_happ_settings()
+        self.assertEqual(values["AdvancedSettings\\tunDnsEnable"], "false")
+        self.assertEqual(values["LogSettings\\xrayCoreLogLevel"], "info")
+        self.assertEqual(w.happ_settings_problems(self.cfg), [])
+
+    def test_other_sections_survive_and_backup_is_written(self):
+        w.apply_happ_settings(w.desired_happ_settings(self.cfg))
+        text = self.conf.read_text(encoding="utf-8")
+        self.assertIn("[General]\nlang=ru", text)
+        self.assertIn("[Vacancy]\nseen=1", text)
+        self.assertEqual(w.HAPP_SETTINGS_BACKUP.read_text(encoding="utf-8"), SAMPLE_HAPP_CONF)
+
+    def test_running_happ_is_left_alone(self):
+        # Happ перезаписывает файл своим состоянием из памяти — правка пропала бы.
+        happ = w.Happ(self.cfg)
+        happ.gui_running = lambda: True
+        state: dict = {}
+        self.assertEqual(w.selfheal_settings(self.cfg, happ, state), [])
+        self.assertIn("tunDnsEnable=true", self.conf.read_text(encoding="utf-8"))
+        self.assertTrue(state["settings_notice"])          # предупредили один раз
+
+    def test_closed_happ_gets_fixed(self):
+        happ = w.Happ(self.cfg)
+        happ.gui_running = lambda: False
+        fixed = w.selfheal_settings(self.cfg, happ, {})
+        self.assertEqual(len(fixed), 2)
+        self.assertIn("tunDnsEnable=false", self.conf.read_text(encoding="utf-8"))
+
+    def test_nothing_to_do_is_silent(self):
+        w.apply_happ_settings(w.desired_happ_settings(self.cfg))
+        happ = w.Happ(self.cfg)
+        happ.gui_running = lambda: False
+        self.assertEqual(w.selfheal_settings(self.cfg, happ, {}), [])
+
+    def test_disabled_switches_are_respected(self):
+        self.cfg["selfheal"]["fix_tun_dns"] = False
+        self.cfg["selfheal"]["fix_core_log_level"] = False
+        self.assertEqual(w.desired_happ_settings(self.cfg), {})
+        self.assertEqual(w.happ_settings_problems(self.cfg), [])
+
+
+class OrphanCores(unittest.TestCase):
+    """Ядро, пережившее свой GUI, проверяется на настоящем процессе."""
+
+    def setUp(self):
+        import subprocess
+        self.cfg = default_cfg()
+        self.cfg["selfheal"]["orphan_grace"] = 0.5
+        self.proc = subprocess.Popen(["sleep", "47"])
+        self.saved = (w.XRAY_PATH_HINT, w.SINGBOX_PATH_HINT)
+        w.XRAY_PATH_HINT = "sleep 47"
+        w.SINGBOX_PATH_HINT = "нет-такого-процесса"
+        self.happ = w.Happ(self.cfg)
+        self.happ.gui_running = lambda: False
+
+    def tearDown(self):
+        w.XRAY_PATH_HINT, w.SINGBOX_PATH_HINT = self.saved
+        self.proc.kill()
+        self.proc.wait()
+
+    def test_first_sighting_only_starts_the_clock(self):
+        state: dict = {}
+        self.assertEqual(w.selfheal_orphan_cores(self.cfg, self.happ, state), [])
+        self.assertIn("orphan_since", state)
+        self.assertIsNone(self.proc.poll())              # процесс цел
+
+    def test_orphan_is_killed_after_grace(self):
+        state = {"orphan_since": time.time() - 5}
+        done = w.selfheal_orphan_cores(self.cfg, self.happ, state)
+        self.assertTrue(any("осиротевший xray" in line for line in done))
+        self.proc.wait(timeout=5)
+        self.assertIsNotNone(self.proc.poll())           # действительно снят
+
+    def test_living_gui_means_no_orphans(self):
+        self.happ.gui_running = lambda: True
+        state = {"orphan_since": time.time() - 5}
+        self.assertEqual(w.selfheal_orphan_cores(self.cfg, self.happ, state), [])
+        self.assertNotIn("orphan_since", state)          # счётчик сброшен
+        self.assertIsNone(self.proc.poll())
+
+    def test_switch_off_disables_killing(self):
+        self.cfg["selfheal"]["kill_orphan_cores"] = False
+        state = {"orphan_since": time.time() - 5}
+        self.assertEqual(w.selfheal_orphan_cores(self.cfg, self.happ, state), [])
+        self.assertIsNone(self.proc.poll())
+
+
 class LogSummary(unittest.TestCase):
     @staticmethod
     def events(pairs):

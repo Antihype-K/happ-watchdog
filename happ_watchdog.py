@@ -101,6 +101,15 @@ DEFAULTS: dict = {
         "log_error_threshold": 40,
         "log_window": 120,
     },
+    "selfheal": {
+        "enabled": True,
+        "check_interval": 300,
+        "fix_tun_dns": True,
+        "fix_core_log_level": True,
+        "core_log_level": "info",
+        "kill_orphan_cores": True,
+        "orphan_grace": 60,
+    },
     "geo": {
         "autofix": True,
         "check_interval": 1800,
@@ -203,6 +212,17 @@ host = "api.anthropic.com"
 path = "/"
 code = 404
 critical = false
+
+[selfheal]
+# Починка причин, а не симптомов. Настройки Happ правятся только при закрытом
+# Happ: запущенный перезапишет файл своим состоянием из памяти.
+enabled = true
+check_interval = 300
+fix_tun_dns = true            # tunDnsEnable=true — DNS мимо туннеля, браузер не открывает сайты
+fix_core_log_level = true     # без уровня логов Happ не пишет core/tun-логи вовсе
+core_log_level = "info"
+kill_orphan_cores = true      # xray, переживший свой GUI, держит SOCKS-порт
+orphan_grace = 60             # сколько ждать, прежде чем счесть ядро осиротевшим
 
 [geo]
 # Профиль маршрутизации приносит урезанные geo-файлы, и ядро xray не стартует,
@@ -742,6 +762,9 @@ class Happ:
         return bool([p for p in pids_matching(self.binary) if p != os.getpid()])
 
     def restart_gui(self) -> bool:
+        return self.kill_gui() and self.start_gui()
+
+    def kill_gui(self) -> bool:
         pids = pids_matching(self.binary)
         for pid in pids:
             try:
@@ -757,8 +780,9 @@ class Happ:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-        if self.stop.wait(1.5):
-            return False
+        return not self.stop.wait(1.5)
+
+    def start_gui(self) -> bool:
         try:
             subprocess.Popen(["setsid", self.binary], env=session_env(),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1425,6 +1449,167 @@ def geo_selfcheck(cfg: dict, *, apply_fix: bool = True) -> list[str]:
     return messages
 
 
+# --------------------------------------------------------------------------
+# самолечение: устраняем причины, а не симптомы
+# --------------------------------------------------------------------------
+
+HAPP_SETTINGS_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "Happ.conf"
+HAPP_SETTINGS_BACKUP = HAPP_SETTINGS_PATH.with_name("Happ.conf.happ-watchdog.bak")
+SETTINGS_SECTION = "[Preferences]"
+
+
+def read_happ_settings() -> dict[str, str]:
+    """Ключи секции [Preferences] из Happ.conf."""
+    values: dict[str, str] = {}
+    try:
+        text = HAPP_SETTINGS_PATH.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return values
+    section = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped
+        elif section == SETTINGS_SECTION and "=" in stripped:
+            key, _, value = stripped.partition("=")
+            values[key.strip()] = value.strip()
+    return values
+
+
+def desired_happ_settings(cfg: dict) -> dict[str, str]:
+    """Настройки Happ, которые сторож считает единственно верными.
+
+    tunDnsEnable=true — та самая причина «браузер не открывает сайты при живом
+    туннеле»: DNS уходит мимо VPN, и цензурируемые имена не резолвятся.
+    xrayCoreLogLevel задаёт уровень логов ядра; без него Happ не пишет
+    core/tun-логи вовсе, и проверка логов остаётся бутафорией.
+    """
+    want: dict[str, str] = {}
+    if cfg["selfheal"]["fix_tun_dns"]:
+        want["AdvancedSettings\\tunDnsEnable"] = "false"
+    if cfg["selfheal"]["fix_core_log_level"]:
+        want["LogSettings\\xrayCoreLogLevel"] = str(cfg["selfheal"]["core_log_level"])
+    return want
+
+
+def happ_settings_problems(cfg: dict) -> list[str]:
+    current = read_happ_settings()
+    return [f"{key}={value} (сейчас {current.get(key, 'не задано')})"
+            for key, value in desired_happ_settings(cfg).items()
+            if current.get(key) != value]
+
+
+def apply_happ_settings(pairs: dict[str, str]) -> list[str]:
+    """Правит [Preferences] в Happ.conf, сохранив резервную копию.
+
+    Вызывать только при закрытом Happ: он держит настройки в памяти и при
+    выходе перезаписывает файл целиком, стирая любую правку.
+    """
+    try:
+        text = HAPP_SETTINGS_PATH.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError as exc:
+        log(f"не читается {HAPP_SETTINGS_PATH}: {exc}", level="warn")
+        return []
+
+    lines = text.splitlines()
+    section, applied, remaining = "", [], dict(pairs)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped
+            continue
+        if section != SETTINGS_SECTION or "=" not in stripped:
+            continue
+        key = stripped.partition("=")[0].strip()
+        if key in remaining:
+            lines[index] = f"{key}={remaining.pop(key)}"
+            applied.append(key)
+
+    if remaining:
+        if SETTINGS_SECTION in [ln.strip() for ln in lines]:
+            at = [ln.strip() for ln in lines].index(SETTINGS_SECTION) + 1
+        else:
+            lines.append(SETTINGS_SECTION)
+            at = len(lines)
+        for key, value in remaining.items():
+            lines.insert(at, f"{key}={value}")
+            applied.append(key)
+
+    if not applied:
+        return []
+    try:
+        HAPP_SETTINGS_BACKUP.write_text(text, encoding="utf-8", errors="surrogateescape")
+        HAPP_SETTINGS_PATH.write_text("\n".join(lines) + "\n",
+                                      encoding="utf-8", errors="surrogateescape")
+    except OSError as exc:
+        log(f"не удалось записать {HAPP_SETTINGS_PATH}: {exc}", level="error")
+        return []
+    return [f"{key}={pairs[key]}" for key in applied]
+
+
+def selfheal_settings(cfg: dict, happ: Happ, state: dict) -> list[str]:
+    problems = happ_settings_problems(cfg)
+    if not problems:
+        state.pop("settings_notice", None)
+        return []
+    if happ.gui_running():
+        # Правка при запущенном Happ бессмысленна — он перезапишет файл из памяти.
+        if not state.get("settings_notice"):
+            log("настройки Happ надо поправить, но он запущен — сделаю, когда закроется: "
+                + "; ".join(problems), level="warn")
+            state["settings_notice"] = True
+        return []
+    fixed = apply_happ_settings(desired_happ_settings(cfg))
+    state.pop("settings_notice", None)
+    return fixed
+
+
+def selfheal_orphan_cores(cfg: dict, happ: Happ, state: dict) -> list[str]:
+    """Ядра, пережившие свой GUI.
+
+    Осиротевший xray держит SOCKS-порт, из-за чего заново запущенный Happ не
+    может подняться. sing-box запускается демоном от root — его сторож убить не
+    может и честно говорит, чем это лечится.
+    """
+    if not cfg["selfheal"]["kill_orphan_cores"] or happ.gui_running():
+        state.pop("orphan_since", None)
+        return []
+
+    xray = pids_matching(XRAY_PATH_HINT)
+    singbox = pids_matching(SINGBOX_PATH_HINT)
+    if not xray and not singbox:
+        state.pop("orphan_since", None)
+        return []
+
+    since = state.get("orphan_since")
+    if since is None:
+        state["orphan_since"] = time.time()      # подождём: Happ мог просто закрываться
+        return []
+    if time.time() - since < float(cfg["selfheal"]["orphan_grace"]):
+        return []
+
+    done: list[str] = []
+    for pid in xray:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            done.append(f"убит осиротевший xray (pid {pid})")
+        except OSError as exc:
+            log(f"не удалось снять xray {pid}: {exc}", level="warn")
+    if singbox:
+        service = cfg["recovery"]["daemon_service"]
+        log(f"sing-box (pid {singbox[0]}) жив без Happ, но запущен от root — "
+            f"снимите его сами: sudo systemctl restart {service}", level="warn")
+    if done:
+        state.pop("orphan_since", None)
+    return done
+
+
+def selfheal(cfg: dict, happ: Happ, state: dict) -> list[str]:
+    if not cfg["selfheal"]["enabled"]:
+        return []
+    return selfheal_settings(cfg, happ, state) + selfheal_orphan_cores(cfg, happ, state)
+
+
 def load_state() -> dict:
     try:
         return json.loads(STATE_PATH.read_text())
@@ -1505,7 +1690,12 @@ class Recovery:
         elif kind == "gui":
             self.happ.disconnect()
             self.stop.wait(2)
-            self.happ.restart_gui()
+            self.happ.kill_gui()
+            # Единственное окно, когда настройки Happ вообще можно править:
+            # запущенный Happ перезапишет файл своим состоянием из памяти.
+            for fix in selfheal_settings(self.cfg, self.happ, self.state):
+                log(f"починена настройка Happ, пока он закрыт: {fix}", level="ok")
+            self.happ.start_gui()
             self.stop.wait(2)
             self.happ.connect()
         else:
@@ -1571,6 +1761,13 @@ def cmd_check(cfg: dict, args: argparse.Namespace) -> int:
     print(geo_check.line())
     if geo_problems:
         print("      " + c("почините: happ-fix-geo fix", "yellow"))
+
+    settings_problems = happ_settings_problems(cfg)
+    print(Check("Настройки Happ", not settings_problems,
+                "; ".join(settings_problems) if settings_problems
+                else "всё как надо", critical=False).line())
+    if settings_problems:
+        print("      " + c("сторож поправит их, когда Happ будет закрыт", "yellow"))
     if health.uplink_down:
         print("\n  " + c("НЕТ ФИЗИЧЕСКОЙ СЕТИ", "yellow") + " — VPN перезапускать бесполезно\n")
         return 3
@@ -1848,6 +2045,8 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     next_ping = time.monotonic() + 5 if ping_interval > 0 else float("inf")
     geo_interval = float(cfg["geo"]["check_interval"]) if cfg["geo"]["autofix"] else 0
     next_geo = time.monotonic() if geo_interval > 0 else float("inf")
+    selfheal_interval = float(cfg["selfheal"]["check_interval"]) if cfg["selfheal"]["enabled"] else 0
+    next_selfheal = time.monotonic() if selfheal_interval > 0 else float("inf")
 
     while not stop.is_set():
         started = time.monotonic()
@@ -1923,6 +2122,14 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
 
         if stop.is_set():
             break            # дальше идут долгие фоновые задачи — они подождут до запуска
+
+        if time.monotonic() >= next_selfheal:
+            next_selfheal = time.monotonic() + selfheal_interval
+            try:
+                for fix in selfheal(cfg, happ, state):
+                    log(f"самолечение: {fix}", level="ok")
+            except Exception as exc:  # noqa: BLE001 — сторож не должен падать из-за этого
+                log(f"самолечение не удалось: {type(exc).__name__}: {exc}", level="warn")
 
         if time.monotonic() >= next_geo:
             next_geo = time.monotonic() + geo_interval

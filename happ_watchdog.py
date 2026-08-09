@@ -244,7 +244,29 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
             cfg[section].update(values)
         else:
             cfg[section] = values
+    for message in unknown_keys(user):
+        log(message, level="warn")
     return cfg
+
+
+def unknown_keys(user: dict) -> list[str]:
+    """Ключи, которых нет в DEFAULTS.
+
+    Молчаливо проигнорированная опечатка — худший вид ошибки в конфиге сторожа:
+    `inteval = 5` не поменяет ничего, а выглядит как рабочая настройка.
+    """
+    messages = []
+    for section, values in user.items():
+        if section not in DEFAULTS:
+            messages.append(f"конфиг: неизвестная секция [{section}] — она ни на что не влияет")
+            continue
+        if not isinstance(values, dict):
+            continue
+        for key in values:
+            if key not in DEFAULTS[section]:
+                messages.append(f"конфиг: неизвестный ключ {section}.{key} — "
+                                "он ни на что не влияет (опечатка?)")
+    return messages
 
 
 # --------------------------------------------------------------------------

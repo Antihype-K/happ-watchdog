@@ -348,6 +348,75 @@ class ExpectedCodes(unittest.TestCase):
         self.assertFalse(w.Health(checks=checks).ok)
 
 
+class SubscriptionStatus(unittest.TestCase):
+    """Срок и трафик берутся из заголовка subscription-userinfo — провайдеры
+    отдают его даже когда тело ответа для чужого клиента заглушка."""
+
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.saved = w.SUBS_CACHE_PATH
+        w.SUBS_CACHE_PATH = Path(tempfile.mkdtemp()) / "subscriptions_cache.json"
+
+    def tearDown(self):
+        w.SUBS_CACHE_PATH = self.saved
+
+    def write_cache(self, userinfo: str, title: str = "Провайдер"):
+        w.SUBS_CACHE_PATH.write_text(json.dumps(
+            {"https://example.com/sub": {"ts": time.time(), "servers": [],
+                                         "userinfo": userinfo, "title": title}}))
+
+    def test_parses_real_header(self):
+        # Ровно то, что отдаёт s.migapp.net.
+        info = w.parse_userinfo("upload=0; download=7082268009; total=536870912000; "
+                                "expire=1788238800")
+        self.assertEqual(info["download"], 7082268009)
+        self.assertEqual(info["expire"], 1788238800)
+
+    def test_ignores_garbage(self):
+        self.assertEqual(w.parse_userinfo("ерунда; total=; expire=скоро"), {})
+
+    def test_decodes_base64_title(self):
+        self.assertEqual(w.decode_profile_title("base64:4pyoIE1JRyBWUE4="), "✨ MIG VPN")
+        self.assertEqual(w.decode_profile_title("Просто текст"), "Просто текст")
+
+    def test_healthy_subscription_is_quiet(self):
+        self.write_cache(f"upload=0; download=10; total=1000; expire={int(time.time()) + 40 * 86400}")
+        self.assertEqual(w.subscription_problems(self.cfg), [])
+        self.assertTrue(w.check_subscription(self.cfg).ok)
+
+    def test_expiring_soon_is_reported(self):
+        self.write_cache(f"upload=0; download=10; total=0; expire={int(time.time()) + 2 * 86400}")
+        problems = w.subscription_problems(self.cfg)
+        self.assertTrue(any("осталось 2" in p for p in problems), problems)
+
+    def test_already_expired(self):
+        self.write_cache(f"upload=0; download=10; total=0; expire={int(time.time()) - 60}")
+        self.assertTrue(any("истекла" in p for p in w.subscription_problems(self.cfg)))
+
+    def test_traffic_almost_spent(self):
+        self.write_cache("upload=0; download=950; total=1000; expire=0")
+        self.assertTrue(any("трафик 95%" in p for p in w.subscription_problems(self.cfg)))
+
+    def test_unlimited_traffic_never_warns(self):
+        self.write_cache("upload=0; download=999999999; total=0; expire=0")
+        self.assertEqual(w.subscription_problems(self.cfg), [])
+
+    def test_problem_is_not_critical(self):
+        # Перезапуск VPN истёкшую подписку не лечит — дёргать туннель нельзя.
+        self.write_cache(f"upload=0; download=10; total=0; expire={int(time.time()) - 60}")
+        check = w.check_subscription(self.cfg)
+        self.assertFalse(check.ok)
+        self.assertFalse(check.critical)
+        self.assertTrue(w.Health(checks=[check]).ok)
+
+    def test_no_data_yet(self):
+        self.assertTrue(w.check_subscription(self.cfg).ok)
+
+    def test_human_bytes(self):
+        self.assertEqual(w.human_bytes(536870912000), "500 ГБ")
+        self.assertEqual(w.human_bytes(0), "0 Б")
+
+
 class GuardedChecks(unittest.TestCase):
     def test_exception_becomes_non_critical_check(self):
         def boom():

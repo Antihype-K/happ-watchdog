@@ -143,6 +143,9 @@ DEFAULTS: dict = {
         "discover_min_share": 0.5,
         "discover_min_conns": 2,
         "ping_interval": 300,
+        "check_subscription": True,
+        "warn_days_before_expire": 5,
+        "warn_traffic_ratio": 0.9,
         "restart_if_active_server_dead": True,
     },
 }
@@ -274,6 +277,13 @@ auto_discover = true          # определять активный серве
 discover_min_share = 0.5      # доля соединений, чтобы счесть адрес сервером VPN, а не прямым коннектом
 discover_min_conns = 2
 ping_interval = 300           # как часто пинговать серверы в режиме run (0 — выключить)
+
+# Срок и трафик подписки берутся из заголовка subscription-userinfo — провайдеры
+# отдают его даже когда тело ответа для чужого клиента заглушка. Ни одно
+# переподключение не лечит истёкшую подписку, поэтому о ней надо знать заранее.
+check_subscription = true
+warn_days_before_expire = 5
+warn_traffic_ratio = 0.9      # доля выбранного трафика, после которой предупреждать
 restart_if_active_server_dead = true
 """
 
@@ -1260,6 +1270,7 @@ def run_health(cfg: dict, *, include_logs: bool = True) -> Health:
     tasks += [("DNS", partial(check_dns, cfg)),
               ("Системный DNS (браузер)", partial(check_system_dns, cfg)),
               ("Утечка мимо туннеля", partial(check_leak, cfg)),
+              ("Подписка", partial(check_subscription, cfg)),
               ("Ожидаемые коды ответа", partial(check_expected, cfg))]
     if include_logs and cfg["checks"]["scan_logs"]:
         tasks.append(("Логи ядра Happ", partial(check_happ_logs, cfg)))
@@ -1347,6 +1358,10 @@ def fetch_subscription(url: str, cfg: dict) -> list[tuple[str, int, str]]:
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
+            # Заголовки провайдер отдаёт даже когда тело — заглушка для чужого
+            # клиента: срок и трафик узнаём, а список серверов нет.
+            userinfo = resp.headers.get("subscription-userinfo") or ""
+            title = decode_profile_title(resp.headers.get("profile-title") or "")
     except Exception as exc:  # noqa: BLE001
         log(f"подписка {mask_url(url)}: {type(exc).__name__}: {exc}", level="warn")
         _store_subs_cache(cache, url, [])
@@ -1356,7 +1371,7 @@ def fetch_subscription(url: str, cfg: dict) -> list[tuple[str, int, str]]:
         try:
             text = base64.b64decode(raw + b"=" * (-len(raw) % 4)).decode("utf-8", "replace")
         except (binascii.Error, UnicodeDecodeError):
-            _store_subs_cache(cache, url, [])
+            _store_subs_cache(cache, url, [], userinfo, title)
             return []
     servers = []
     for line in text.splitlines():
@@ -1366,18 +1381,108 @@ def fetch_subscription(url: str, cfg: dict) -> list[tuple[str, int, str]]:
     if not servers and "0.0.0.0:1" in text:
         log(f"подписка {mask_url(url)}: провайдер вернул заглушку "
             "(нужен правильный X-HWID) — серверы не получены", level="warn")
-    _store_subs_cache(cache, url, servers)
+    _store_subs_cache(cache, url, servers, userinfo, title)
     return servers
 
 
-def _store_subs_cache(cache: dict, url: str, servers: list[tuple[str, int, str]]) -> None:
-    cache[url] = {"ts": time.time(), "servers": [list(s) for s in servers]}
+def _store_subs_cache(cache: dict, url: str, servers: list[tuple[str, int, str]],
+                      userinfo: str = "", title: str = "") -> None:
+    cache[url] = {"ts": time.time(), "servers": [list(s) for s in servers],
+                  "userinfo": userinfo, "title": title}
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         SUBS_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False))
         SUBS_CACHE_PATH.chmod(0o600)
     except OSError:
         pass
+
+
+def decode_profile_title(raw: str) -> str:
+    """Заголовок profile-title: обычно «base64:<…>», иногда просто текст."""
+    if not raw.startswith("base64:"):
+        return raw
+    try:
+        return base64.b64decode(raw[7:] + "=" * (-len(raw[7:]) % 4)).decode("utf-8", "replace")
+    except (binascii.Error, UnicodeDecodeError):
+        return raw
+
+
+def parse_userinfo(raw: str) -> dict[str, int]:
+    """`upload=0; download=123; total=456; expire=1788238800` → числа."""
+    values: dict[str, int] = {}
+    for part in raw.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key and value.strip().lstrip("-").isdigit():
+            values[key.strip()] = int(value.strip())
+    return values
+
+
+def subscription_status(cfg: dict) -> list[tuple[str, dict[str, int], str]]:
+    """(название, показатели, url) по каждой подписке из кэша.
+
+    Только кэш: сеть на каждом цикле проверок дёргать незачем, данные обновляет
+    цикл пинга.
+    """
+    result = []
+    for url, entry in _subs_cache().items():
+        info = parse_userinfo(entry.get("userinfo", ""))
+        if info:
+            result.append((entry.get("title") or mask_url(url), info, url))
+    return result
+
+
+def subscription_problems(cfg: dict) -> list[str]:
+    """Подписки, которые скоро кончатся или уже выбраны по трафику.
+
+    Ни одно переподключение этого не лечит: сервер жив, а пускать перестал.
+    Без такой проверки сторож будет часами долбиться в чужой отказ.
+    """
+    days = float(cfg["servers"]["warn_days_before_expire"])
+    ratio = float(cfg["servers"]["warn_traffic_ratio"])
+    problems = []
+    for title, info, _url in subscription_status(cfg):
+        expire = info.get("expire", 0)
+        if expire:
+            left = expire - time.time()
+            if left <= 0:
+                problems.append(f"{title}: подписка истекла")
+            elif left < days * 86400:
+                problems.append(f"{title}: осталось {left / 86400:.1f} дн.")
+        total = info.get("total", 0)
+        used = info.get("download", 0) + info.get("upload", 0)
+        if total > 0 and used >= total * ratio:
+            problems.append(f"{title}: трафик {used / total * 100:.0f}% "
+                            f"({human_bytes(used)} из {human_bytes(total)})")
+    return problems
+
+
+def human_bytes(value: float) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if abs(value) < 1024:
+            return f"{value:.0f} {unit}"
+        value /= 1024
+    return f"{value:.1f} ТБ"
+
+
+def check_subscription(cfg: dict) -> Check:
+    name = "Подписка"
+    if not cfg["servers"]["check_subscription"]:
+        return Check(name, True, "проверка выключена", critical=False)
+    status = subscription_status(cfg)
+    if not status:
+        return Check(name, True, "нет данных (появятся после цикла пинга)", critical=False)
+    problems = subscription_problems(cfg)
+    if problems:
+        # Некритично намеренно: перезапуск VPN тут бесполезен, нужен человек.
+        return Check(name, False, "; ".join(problems), critical=False)
+    details = []
+    for title, info, _url in status:
+        left = (info.get("expire", 0) - time.time()) / 86400 if info.get("expire") else None
+        used = human_bytes(info.get("download", 0) + info.get("upload", 0))
+        total = info.get("total", 0)
+        details.append(f"{title}: {used}" + (f" из {human_bytes(total)}" if total else "")
+                       + (f", ещё {left:.0f} дн." if left else ""))
+    return Check(name, True, "; ".join(details), critical=False)
 
 
 def mask_url(url: str) -> str:
@@ -1926,6 +2031,14 @@ def cmd_ping(cfg: dict, args: argparse.Namespace) -> int:
     via = "через активный туннель" if tun_up else "напрямую"
     print(c(f"\n  Пинг серверов ({via})\n", "bold"))
     results = ping_servers(cfg)
+    for title, info, _url in subscription_status(cfg):
+        used = human_bytes(info.get("download", 0) + info.get("upload", 0))
+        total = info.get("total", 0)
+        left = (info.get("expire", 0) - time.time()) / 86400 if info.get("expire") else None
+        print(f"  {title}: {used}" + (f" из {human_bytes(total)}" if total else "")
+              + (f", осталось {left:.0f} дн." if left else ""))
+    if subscription_status(cfg):
+        print()
     if not results:
         print("  Серверы не найдены. Добавьте их в [servers] list в "
               f"{CONFIG_PATH}\n  (host:port или ссылки vless:// / vmess:// / trojan:// / ss://)\n")
@@ -2308,11 +2421,22 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
                 log(f"пинг серверов: живых {len(alive)}/{len(results)}"
                     + (f", лучший {alive[0].host}:{alive[0].port} {alive[0].ms:.0f} ms"
                        if alive else ""), level="info")
-                if (cfg["servers"]["restart_if_active_server_dead"] and results
+                if (cfg["servers"]["restart_if_active_server_dead"]
                         and not alive and not health.uplink_down):
                     log("ни один сервер не отвечает — принудительное переподключение",
                         level="error")
                     recovery.perform("ни один сервер подписки не отвечает")
+
+            # Данные подписки обновились вместе с пингом: проверяем здесь же.
+            subs_problems = subscription_problems(cfg)
+            if subs_problems and not state.get("subs_notice"):
+                # Переподключением не лечится — говорим один раз и не долбим.
+                log("подписка: " + "; ".join(subs_problems), level="warn")
+                if cfg["general"]["notify"]:
+                    notify("Happ: с подпиской беда", "; ".join(subs_problems)[:160])
+                state["subs_notice"] = True
+            elif not subs_problems:
+                state.pop("subs_notice", None)
 
         elapsed = time.monotonic() - started
         if elapsed > interval * 1.5:

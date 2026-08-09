@@ -1310,7 +1310,10 @@ class Recovery:
                     level="warn")
                 self.state["escalation_notice"] = True
 
-        self.state.setdefault("restarts", []).append(time.time())
+        # История нужна только за последние сутки: без чистки список рос вечно.
+        cutoff = time.time() - 86400
+        self.state["restarts"] = [t for t in self.state.get("restarts", []) if t > cutoff]
+        self.state["restarts"].append(time.time())
         if kind in ("gui", "daemon"):
             self.state.setdefault("escalations", []).append(time.time())
         save_state(self.state)

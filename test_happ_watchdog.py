@@ -417,6 +417,44 @@ class SubscriptionStatus(unittest.TestCase):
         self.assertEqual(w.human_bytes(0), "0 Б")
 
 
+class Webhook(unittest.TestCase):
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.sent: list[tuple[str, bytes]] = []
+
+        class FakeOpener:
+            def __init__(inner, request, timeout=None):  # noqa: N805
+                self.sent.append((request.full_url, request.data))
+            def __enter__(inner): return inner          # noqa: N805
+            def __exit__(inner, *a): return False       # noqa: N805
+
+        import urllib.request
+        self.saved = urllib.request.urlopen
+        urllib.request.urlopen = FakeOpener
+
+    def tearDown(self):
+        import urllib.request
+        urllib.request.urlopen = self.saved
+
+    def test_disabled_by_default(self):
+        self.assertFalse(w.post_webhook(self.cfg, "не должно уйти"))
+        self.assertEqual(self.sent, [])
+
+    def test_telegram_shape(self):
+        self.cfg["notify"]["webhook_url"] = "https://api.telegram.org/botTOKEN/sendMessage"
+        self.cfg["notify"]["webhook_extra"] = {"chat_id": "42"}
+        self.assertTrue(w.post_webhook(self.cfg, "Happ: VPN лежит"))
+        url, data = self.sent[0]
+        self.assertIn("sendMessage", url)
+        self.assertEqual(json.loads(data), {"text": "Happ: VPN лежит", "chat_id": "42"})
+
+    def test_delivery_failure_is_survivable(self):
+        import urllib.request
+        urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(OSError("сеть лежит"))
+        self.cfg["notify"]["webhook_url"] = "https://example.com/hook"
+        self.assertFalse(w.post_webhook(self.cfg, "сообщение"))
+
+
 class GuardedChecks(unittest.TestCase):
     def test_exception_becomes_non_critical_check(self):
         def boom():

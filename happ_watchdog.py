@@ -66,6 +66,12 @@ DEFAULTS: dict = {
         "quiet_when_healthy": True,
         "only_when_gui_running": True,
     },
+    "notify": {
+        "webhook_url": "",
+        "webhook_extra": {},
+        "webhook_after": 300,
+        "webhook_timeout": 10,
+    },
     "happ": {
         "binary": "/opt/happ/bin/Happ",
         "socks_host": "127.0.0.1",
@@ -164,6 +170,18 @@ startup_grace = 45            # после запуска Happ дать тунн
 notify = true                 # уведомления через notify-send
 quiet_when_healthy = true     # не писать в лог каждую успешную проверку
 only_when_gui_running = true  # если Happ закрыт — считать, что VPN выключен намеренно
+
+[notify]
+# Сообщение наружу, когда notify-send некому показать (ноутбук заблокирован,
+# вас нет за ним). Пустой URL — выключено. Уходит POST-ом с JSON {"text": ...}
+# плюс поля из webhook_extra; для Telegram это URL бота .../sendMessage и
+# webhook_extra = { chat_id = "123456" }.
+# Учтите: сообщение идёт через тот же туннель, который лежит, — доставка не
+# гарантирована.
+webhook_url = ""
+webhook_extra = {}
+webhook_after = 300           # сколько секунд непрерывного сбоя до отправки
+webhook_timeout = 10
 
 [happ]
 binary = "/opt/happ/bin/Happ"
@@ -358,6 +376,28 @@ def log(msg: str, *, level: str = "info", echo: bool = True) -> None:
     if echo:
         colors = {"error": "red", "warn": "yellow", "ok": "green", "info": "grey"}
         print(c(line, colors.get(level, "grey")) if level in colors else line, flush=True)
+
+
+def post_webhook(cfg: dict, text: str) -> bool:
+    """Сообщение наружу — когда notify-send некому показать.
+
+    Уходит через тот же туннель, который лежит, поэтому доставка не
+    гарантирована: это уведомление, а не журнал. Пустой URL — выключено.
+    """
+    url = cfg["notify"]["webhook_url"]
+    if not url:
+        return False
+    import urllib.request
+    payload = {"text": text, **dict(cfg["notify"]["webhook_extra"])}
+    request = urllib.request.Request(
+        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=float(cfg["notify"]["webhook_timeout"])):
+            return True
+    except Exception as exc:  # noqa: BLE001 — недоставленное уведомление не беда
+        log(f"вебхук не отправлен: {type(exc).__name__}: {exc}", level="warn")
+        return False
 
 
 def notify(title: str, body: str, urgency: str = "normal") -> None:
@@ -2214,6 +2254,77 @@ def summarize_log(events: list[tuple[float, str, str]]) -> dict:
     }
 
 
+def cmd_doctor(cfg: dict, args: argparse.Namespace) -> int:
+    """Один отчёт обо всём сразу — чтобы при поломке не собирать это по частям."""
+    def section(title: str) -> None:
+        print(c(f"\n  ── {title} " + "─" * max(0, 58 - len(title)), "bold"))
+
+    print(c(f"\n  happ-watchdog doctor — {time.strftime('%d.%m.%Y %H:%M:%S')}", "bold"))
+
+    section("Окружение")
+    print(f"    {APP} {VERSION}, python {sys.version.split()[0]}")
+    print(f"    сессия: {os.environ.get('XDG_SESSION_TYPE', '?')}, "
+          f"XAUTHORITY={session_env().get('XAUTHORITY', 'нет')}")
+    unit = Path.home() / ".config/systemd/user/happ-watchdog.service"
+    if unit.exists():
+        active = subprocess.run(["systemctl", "--user", "is-active", "happ-watchdog"],
+                                capture_output=True, text=True, check=False).stdout.strip()
+        print(f"    служба: {active}")
+    else:
+        print("    служба: не установлена")
+
+    section("Процессы Happ")
+    for label, needle in (("Happ", cfg["happ"]["binary"]), ("xray", XRAY_PATH_HINT),
+                          ("sing-box", SINGBOX_PATH_HINT), ("happd", "/opt/happ/bin/happd")):
+        pids = pids_matching(needle)
+        print(f"    {label:<9} {'pid ' + ', '.join(map(str, pids)) if pids else 'не запущен'}")
+
+    section("Сеть")
+    route = default_route()
+    print(f"    маршрут по умолчанию: {route[0]} → {route[1]}" if route else "    маршрута нет")
+    tun = cfg["happ"]["tun_interface"]
+    print(f"    {tun}: {iface_addr(tun) or 'нет'}")
+    print(f"    IPv6 наружу: {ipv6_leaks_outside_tunnel(cfg) or 'мимо туннеля не идёт'}")
+    print(f"    резолверы системы: {', '.join(system_resolvers()) or 'нет'}")
+
+    section("Проверки")
+    health = run_health(cfg)
+    for check in health.checks:
+        print("  " + check.line())
+
+    section("Подписки")
+    status = subscription_status(cfg)
+    if not status:
+        print("    данных нет — выполните happ-watchdog ping")
+    for title, info, url in status:
+        used = human_bytes(info.get("download", 0) + info.get("upload", 0))
+        total = info.get("total", 0)
+        left = (info.get("expire", 0) - time.time()) / 86400 if info.get("expire") else None
+        print(f"    {title} ({mask_url(url)}): {used}"
+              + (f" из {human_bytes(total)}" if total else " (без лимита)")
+              + (f", осталось {left:.0f} дн." if left else ""))
+
+    section("Настройки Happ и профиль маршрутизации")
+    problems = happ_settings_problems(cfg)
+    print("    " + ("; ".join(problems) if problems else "настройки в порядке"))
+    try:
+        geo_problems = geo_selfcheck(cfg, apply_fix=False)
+    except Exception as exc:  # noqa: BLE001
+        geo_problems = [f"проверка не удалась: {type(exc).__name__}: {exc}"]
+    print("    " + ("; ".join(geo_problems) if geo_problems else "geo-файлы в порядке"))
+
+    section("Последние события журнала")
+    events = read_log_events(time.time() - 3600)
+    for stamp, level, msg in events[-12:]:
+        print(f"    [{time.strftime('%H:%M:%S', time.localtime(stamp))}] "
+              f"[{level}] {msg[:110]}")
+    if not events:
+        print("    за последний час пусто")
+
+    print(c("\n  Готово. Журнал целиком: " + str(LOG_PATH) + "\n", "grey"))
+    return 0 if health.ok else 1
+
+
 def cmd_stats(cfg: dict, args: argparse.Namespace) -> int:
     try:
         window = parse_duration(args.period)
@@ -2300,6 +2411,8 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     grace_until = 0.0            # до этого момента Happ считается поднимающимся
     crash_since: float | None = None
     crash_grace = float(cfg["recovery"]["crash_grace"])
+    down_since: float | None = None     # начало непрерывного сбоя — для вебхука
+    webhook_sent = False
     next_ping = time.monotonic() + 5 if ping_interval > 0 else float("inf")
     geo_interval = float(cfg["geo"]["check_interval"]) if cfg["geo"]["autofix"] else 0
     next_geo = time.monotonic() if geo_interval > 0 else float("inf")
@@ -2369,6 +2482,11 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
         elif health.ok:
             if fails:
                 log("связь восстановилась сама, счётчик сбоев сброшен", level="ok")
+            if webhook_sent:
+                post_webhook(cfg, f"Happ: связь восстановлена, лежала "
+                                  f"{(time.time() - (down_since or time.time())) / 60:.0f} мин")
+                webhook_sent = False
+            down_since = None
             fails = 0
             state["ladder"] = 0
             status = "здоров"
@@ -2383,7 +2501,14 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
         else:
             fails += 1
             status = "сбой"
+            if down_since is None:
+                down_since = time.time()
             log(f"сбой {fails}/{threshold}: {health.reason()}", level="warn")
+            if (not webhook_sent and cfg["notify"]["webhook_url"]
+                    and time.time() - down_since >= float(cfg["notify"]["webhook_after"])):
+                webhook_sent = post_webhook(
+                    cfg, f"Happ: VPN лежит {(time.time() - down_since) / 60:.0f} мин — "
+                         f"{health.reason()[:300]}")
             if fails >= threshold:
                 recovery.perform(health.reason())
                 fails = 0
@@ -2521,6 +2646,7 @@ def main() -> int:
         "restart": (cmd_restart, "принудительно переподключить VPN"),
         "status": (cmd_status, "состояние сторожа"),
         "stats": (cmd_stats, "сводка по журналу (например: stats 24h)"),
+        "doctor": (cmd_doctor, "один отчёт обо всём сразу для разбора поломки"),
         "pause": (cmd_pause, "не вмешиваться какое-то время (например: pause 30m)"),
         "resume": (cmd_resume, "снять паузу"),
         "install-service": (cmd_install_service, "поставить автозапуск через systemd --user"),

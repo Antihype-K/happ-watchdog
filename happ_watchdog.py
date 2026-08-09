@@ -1667,6 +1667,150 @@ def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+LOG_LINE_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[(\w+)\] (.*)$")
+
+# Имена проверок, какими они попадают в причину сбоя. Длинные идут первыми:
+# «DNS» — часть «Системный DNS (браузер)», и без порядка счёт был бы двойным.
+CHECK_NAMES = ("Системный DNS (браузер)", "Системный путь (через tun)",
+               "Аплинк (физическая сеть)", "Процессы и туннель", "Утечка мимо туннеля",
+               "Логи ядра Happ", "SOCKS", "DNS")
+EXPECT_NAME_RE = re.compile(r"[\w.-]+ → ждём \d+")
+
+# Шаги лестницы ровно так, как их пишет Recovery.plan. Сверяемся со списком, а
+# не режем строку по стрелке: и в названии шага («полный цикл disconnect →
+# connect»), и в причине сбоя («api.anthropic.com → ждём 404») стрелка своя.
+STEP_NAMES = ("мягкое переподключение (happ://connect)", "полный цикл disconnect → connect",
+              "повторный цикл disconnect → connect", "перезапуск процесса Happ",
+              "перезапуск демона happd")
+
+
+def read_log_events(since: float) -> list[tuple[float, str, str]]:
+    """(время, уровень, сообщение) из журнала, начиная с указанного момента."""
+    events: list[tuple[float, str, str]] = []
+    for path in (LOG_PATH.with_suffix(".log.1"), LOG_PATH):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            m = LOG_LINE_RE.match(line)
+            if not m:
+                continue
+            stamp = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+            if stamp >= since:
+                events.append((stamp, m.group(2), m.group(3)))
+    events.sort(key=lambda e: e[0])
+    return events
+
+
+def count_failed_checks(reason: str, counter: dict[str, int]) -> None:
+    for name in CHECK_NAMES:
+        if name in reason:
+            counter[name] = counter.get(name, 0) + 1
+            reason = reason.replace(name, "")
+    for match in EXPECT_NAME_RE.findall(reason):
+        counter[match] = counter.get(match, 0) + 1
+
+
+def summarize_log(events: list[tuple[float, str, str]]) -> dict:
+    """Сводка по журналу: эпизоды сбоя, вмешательства, виновники.
+
+    Границы эпизода считаются по записям сторожа, а он смотрит раз в
+    `interval` — значит длительность известна с точностью до одного цикла.
+    """
+    episodes: list[tuple[float, float]] = []
+    started: float | None = None
+    steps: dict[str, int] = {}
+    culprits: dict[str, int] = {}
+    recovered = self_healed = gave_up = 0
+
+    for stamp, _level, msg in events:
+        if msg.startswith("сбой "):
+            if started is None:
+                started = stamp
+            _, _, reason = msg.partition(": ")
+            count_failed_checks(reason, culprits)
+        elif msg.startswith("VPN сбоит:"):
+            step = next((s for s in STEP_NAMES if msg.endswith(s)), "неизвестный шаг")
+            steps[step] = steps.get(step, 0) + 1
+        elif msg.startswith("VPN восстановлен после"):
+            recovered += 1
+            if started is not None:
+                episodes.append((started, stamp))
+                started = None
+        elif msg.startswith("связь восстановилась сама"):
+            self_healed += 1
+            if started is not None:
+                episodes.append((started, stamp))
+                started = None
+        elif msg.startswith("после «"):
+            gave_up += 1
+        elif msg.startswith("остановлен") and started is not None:
+            episodes.append((started, stamp))     # эпизод оборвался перезапуском сторожа
+            started = None
+
+    if started is not None and events:
+        episodes.append((started, events[-1][0]))
+    return {
+        "episodes": episodes,
+        "steps": steps,
+        "culprits": culprits,
+        "recovered": recovered,
+        "self_healed": self_healed,
+        "failed_attempts": gave_up,
+    }
+
+
+def cmd_stats(cfg: dict, args: argparse.Namespace) -> int:
+    try:
+        window = parse_duration(args.period)
+    except ValueError as exc:
+        print(f"  {exc}")
+        return 2
+    events = read_log_events(time.time() - window)
+    if not events:
+        print(f"\n  В журнале нет записей за последние {args.period}\n")
+        return 1
+
+    summary = summarize_log(events)
+    episodes = summary["episodes"]
+    observed = time.time() - events[0][0]
+    downtime = sum(end - start for start, end in episodes)
+    longest = max((end - start for start, end in episodes), default=0.0)
+
+    def human(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.0f} с"
+        if seconds < 3600:
+            return f"{seconds / 60:.0f} мин"
+        return f"{seconds / 3600:.1f} ч"
+
+    print(c(f"\n  happ-watchdog — сводка за {args.period}\n", "bold"))
+    print(f"  Наблюдение         : {human(observed)} (с "
+          f"{time.strftime('%d.%m %H:%M', time.localtime(events[0][0]))})")
+    print(f"  Эпизодов сбоя      : {len(episodes)}")
+    print(f"  Времени без связи  : {human(downtime)}"
+          + (f" ({downtime / observed * 100:.1f}%)" if observed > 0 else ""))
+    print(f"  Самый долгий       : {human(longest)}")
+    print(f"  Прошло само        : {summary['self_healed']}")
+    print(f"  Вылечено сторожем  : {summary['recovered']}")
+    print(f"  Попыток впустую    : {summary['failed_attempts']}")
+
+    if summary["steps"]:
+        print(c("\n  Вмешательства", "bold"))
+        for step, count in sorted(summary["steps"].items(), key=lambda kv: -kv[1]):
+            print(f"    {count:>4}  {step}")
+
+    if summary["culprits"]:
+        print(c("\n  Что падало", "bold"))
+        for name, count in sorted(summary["culprits"].items(), key=lambda kv: -kv[1]):
+            print(f"    {count:>4}  {name}")
+
+    print(c("\n  Длительность эпизодов известна с точностью до одного цикла проверок "
+            f"({cfg['general']['interval']:.0f} с).\n", "grey"))
+    return 0
+
+
 def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     try:
         lock = acquire_run_lock()
@@ -1886,6 +2030,7 @@ def main() -> int:
         "ping": (cmd_ping, "пинг всех известных серверов"),
         "restart": (cmd_restart, "принудительно переподключить VPN"),
         "status": (cmd_status, "состояние сторожа"),
+        "stats": (cmd_stats, "сводка по журналу (например: stats 24h)"),
         "pause": (cmd_pause, "не вмешиваться какое-то время (например: pause 30m)"),
         "resume": (cmd_resume, "снять паузу"),
         "install-service": (cmd_install_service, "поставить автозапуск через systemd --user"),
@@ -1896,6 +2041,9 @@ def main() -> int:
         if name == "pause":
             parser_sub.add_argument("duration", nargs="?", default="30m",
                                     help="длительность: 90s, 30m, 2h, 1d (по умолчанию 30m)")
+        if name == "stats":
+            parser_sub.add_argument("period", nargs="?", default="24h",
+                                    help="за какой срок: 2h, 24h, 7d (по умолчанию 24h)")
 
     args = parser.parse_args()
     if not args.command:

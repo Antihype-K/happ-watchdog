@@ -343,6 +343,60 @@ class SessionEnvironment(unittest.TestCase):
         self.assertNotEqual(env.get("XAUTHORITY"), str(self.runtime / "нет-такого"))
 
 
+class LogSummary(unittest.TestCase):
+    @staticmethod
+    def events(pairs):
+        base = time.time() - 3600
+        return [(base + offset, "WARN", msg) for offset, msg in pairs]
+
+    def test_episode_from_first_failure_to_recovery(self):
+        summary = w.summarize_log(self.events([
+            (0, "сбой 1/3: SOCKS 127.0.0.1:10808: таймаут"),
+            (10, "сбой 2/3: SOCKS 127.0.0.1:10808: таймаут"),
+            (30, "VPN восстановлен после «мягкое переподключение (happ://connect)»"),
+        ]))
+        self.assertEqual(len(summary["episodes"]), 1)
+        start, end = summary["episodes"][0]
+        self.assertEqual(end - start, 30)
+        self.assertEqual(summary["recovered"], 1)
+
+    def test_self_healing_closes_episode(self):
+        summary = w.summarize_log(self.events([
+            (0, "сбой 1/3: DNS: пустой ответ"),
+            (20, "связь восстановилась сама, счётчик сбоев сброшен"),
+        ]))
+        self.assertEqual(summary["self_healed"], 1)
+        self.assertEqual(len(summary["episodes"]), 1)
+
+    def test_watchdog_restart_closes_open_episode(self):
+        summary = w.summarize_log(self.events([
+            (0, "сбой 1/3: DNS: пустой ответ"),
+            (15, "остановлен"),
+        ]))
+        self.assertEqual(len(summary["episodes"]), 1)
+
+    def test_step_with_arrow_in_its_name(self):
+        # «полный цикл disconnect → connect» — стрелка внутри названия шага,
+        # а в причине сбоя есть своя: резать строку по стрелке нельзя.
+        summary = w.summarize_log(self.events([
+            (0, "сбой 1/3: api.anthropic.com → ждём 404: пришло 403"),
+            (5, "VPN сбоит: api.anthropic.com → ждём 404: пришло 403 "
+                "→ полный цикл disconnect → connect"),
+        ]))
+        self.assertEqual(summary["steps"], {"полный цикл disconnect → connect": 1})
+
+    def test_culprits_counted_without_double_counting_dns(self):
+        counter: dict[str, int] = {}
+        w.count_failed_checks("Системный DNS (браузер): не резолвится; DNS: пустой ответ",
+                              counter)
+        self.assertEqual(counter, {"Системный DNS (браузер)": 1, "DNS": 1})
+
+    def test_culprits_include_expected_code_blocks(self):
+        counter: dict[str, int] = {}
+        w.count_failed_checks("api.anthropic.com → ждём 404: пришло 403", counter)
+        self.assertEqual(counter, {"api.anthropic.com → ждём 404": 1})
+
+
 class HealthSemantics(unittest.TestCase):
     def test_non_critical_failure_keeps_health_ok(self):
         health = w.Health(checks=[w.Check("важная", True), w.Check("справочная", False,

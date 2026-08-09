@@ -616,6 +616,39 @@ def xray_endpoints(min_share: float = 0.5, min_conns: int = 2,
 # управление Happ
 # --------------------------------------------------------------------------
 
+def session_env() -> dict[str, str]:
+    """Окружение для запуска Happ с живым XAUTHORITY.
+
+    В Wayland-сессии он указывает на файл вида
+    `/run/user/1000/.mutter-Xwaylandauth.XXXXXX`, имя которого генерируется
+    заново при каждом входе. Замороженный в юните путь протухает после
+    перезагрузки, и deeplink рискует не дойти до графического Happ — поэтому
+    ищем файл в рантайме, а не полагаемся на переменную из юнита.
+    """
+    env = dict(os.environ)
+    current = env.get("XAUTHORITY")
+    if current and Path(current).exists():
+        return env
+
+    runtime = Path(env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    candidates = [HOME / ".Xauthority"]
+    try:
+        candidates += list(runtime.glob(".mutter-Xwaylandauth*"))
+    except OSError:
+        pass
+    alive = []
+    for path in candidates:
+        try:
+            alive.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    if alive:
+        env["XAUTHORITY"] = str(max(alive)[1])       # самый свежий — от текущей сессии
+    else:
+        env.pop("XAUTHORITY", None)                  # мёртвый путь хуже отсутствующего
+    return env
+
+
 class Happ:
     def __init__(self, cfg: dict, stop: threading.Event | None = None):
         self.binary = cfg["happ"]["binary"]
@@ -632,6 +665,7 @@ class Happ:
             return False
         try:
             proc = subprocess.run([self.binary, link], timeout=timeout, check=False,
+                                  env=session_env(),
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return proc.returncode == 0
         except subprocess.TimeoutExpired:
@@ -669,7 +703,7 @@ class Happ:
         if self.stop.wait(1.5):
             return False
         try:
-            subprocess.Popen(["setsid", self.binary],
+            subprocess.Popen(["setsid", self.binary], env=session_env(),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
         except OSError as exc:
@@ -1687,8 +1721,10 @@ def cmd_install_service(cfg: dict, args: argparse.Namespace) -> int:
     unit_path = unit_dir / "happ-watchdog.service"
 
     # Deeplink-ам Happ нужна сессия пользователя — прокидываем её переменные.
+    # XAUTHORITY сюда не входит намеренно: путь к нему меняется при каждом входе
+    # в сессию, поэтому его ищет session_env() перед самым запуском Happ.
     passthrough = ["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
-                   "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY", "QT_QPA_PLATFORM"]
+                   "DBUS_SESSION_BUS_ADDRESS", "QT_QPA_PLATFORM"]
     env_lines = [f'Environment="{key}={os.environ[key]}"' for key in passthrough if os.environ.get(key)]
 
     unit_path.write_text(SERVICE_TEMPLATE.format(

@@ -83,6 +83,7 @@ DEFAULTS: dict = {
         "dns_servers": ["1.1.1.1", "8.8.8.8"],
         "system_dns_domains": ["www.youtube.com"],
         "leak_check": True,
+        "leak_check_ipv6": True,
         "leak_host": "cp.cloudflare.com",
         "leak_path": "/cdn-cgi/trace",
         "expect": [{"host": "api.anthropic.com", "path": "/", "code": 404,
@@ -185,6 +186,7 @@ system_dns_domains = ["www.youtube.com"]
 # системный маршрут; разные сети означают, что трафик системы идёт открыто,
 # хотя туннель при этом выглядит живым (204 приходит по обоим путям одинаково).
 leak_check = true
+leak_check_ipv6 = true       # IPv6 проверяется отдельно: классика — v4 в туннеле, v6 мимо
 leak_host = "cp.cloudflare.com"
 leak_path = "/cdn-cgi/trace"
 
@@ -389,8 +391,17 @@ def socks5_connect(proxy_host: str, proxy_port: int, dst_host: str, dst_port: in
         resp = _recv_exact(sock, 2)
         if resp[0] != 0x05 or resp[1] != 0x00:
             raise OSError(f"SOCKS5: рукопожатие отклонено ({resp.hex()})")
-        host_bytes = dst_host.encode("idna")
-        req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + struct.pack(">H", dst_port)
+        # IP-литерал отправляем как адрес (ATYP 1/4), а не как имя: прокси не
+        # обязан уметь резолвить «2606:4700:4700::1111» и вернёт ошибку.
+        try:
+            req = b"\x05\x01\x00\x01" + socket.inet_pton(socket.AF_INET, dst_host)
+        except OSError:
+            try:
+                req = b"\x05\x01\x00\x04" + socket.inet_pton(socket.AF_INET6, dst_host)
+            except OSError:
+                host_bytes = dst_host.encode("idna")
+                req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes
+        req += struct.pack(">H", dst_port)
         sock.sendall(req)
         head = _recv_exact(sock, 4)
         if head[1] != 0x00:
@@ -430,15 +441,19 @@ def _https_get(host: str, path: str, timeout: float, via_socks: tuple[str, int] 
     """
     t0 = time.monotonic()
     sock = None
+    target = host
+    # IPv6-литерал в заголовке Host обязан быть в скобках, иначе сервер сочтёт
+    # его именем и ответит не тем (Cloudflare молча отдаёт страницу без ip=).
+    host_header = f"[{host}]" if ":" in host else host
     try:
         if via_socks:
-            sock = socks5_connect(via_socks[0], via_socks[1], host, port, timeout)
+            sock = socks5_connect(via_socks[0], via_socks[1], target, port, timeout)
         else:
-            sock = socket.create_connection((host, port), timeout=timeout)
+            sock = socket.create_connection((target, port), timeout=timeout)
         sock.settimeout(timeout)
         tls = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
         sock = tls
-        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\n"
                "User-Agent: happ-watchdog\r\nConnection: close\r\nAccept: */*\r\n\r\n")
         tls.sendall(req.encode())
         if not read_all:
@@ -1023,7 +1038,14 @@ def check_system_dns(cfg: dict) -> Check:
 
 
 def exit_ip(cfg: dict, *, via_socks: bool) -> tuple[str | None, str]:
-    """Внешний IP, каким его видит сервер, — по SOCKS или по системному маршруту."""
+    """Внешний IP, каким его видит сервер, — по SOCKS или по системному маршруту.
+
+    Семейство адресов задать с клиента нельзя: у Happ включён сниффинг
+    (`TunnelSettings\\Sniffing\\useSniffing`), и ядро подменяет адрес назначения
+    доменом из SNI, а выходной узел резолвит его сам — как показал замер,
+    соединение к IPv4-литералу Cloudflare возвращает IPv6-адрес выхода. Поэтому
+    IPv6 проверяется не пробой, а маршрутами: см. ipv6_leaks_outside_tunnel.
+    """
     host = cfg["checks"]["leak_host"]
     path = cfg["checks"]["leak_path"]
     timeout = float(cfg["checks"]["tcp_timeout"])
@@ -1036,6 +1058,59 @@ def exit_ip(cfg: dict, *, via_socks: bool) -> tuple[str | None, str]:
         if line.startswith("ip="):
             return line[3:].strip(), ""
     return None, "в ответе нет строки ip="
+
+
+def ipv6_default_routes(path: Path = Path("/proc/net/ipv6_route")) -> list[tuple[str, int]]:
+    """(интерфейс, метрика) для маршрутов ::/0 — кроме нерабочих через lo."""
+    routes = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return routes
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 10 or fields[0] != "0" * 32 or fields[1] != "00":
+            continue
+        iface, metric = fields[9], int(fields[5], 16)
+        if iface == "lo":
+            continue                     # unreachable-заглушка, а не путь наружу
+        routes.append((iface, metric))
+    return routes
+
+
+def global_ipv6_interfaces(path: Path = Path("/proc/net/if_inet6")) -> list[str]:
+    """Интерфейсы с глобальным IPv6-адресом (scope 00)."""
+    found = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return found
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 6 and fields[3] == "00" and fields[5] not in found:
+            found.append(fields[5])
+    return found
+
+
+def ipv6_leaks_outside_tunnel(cfg: dict) -> str | None:
+    """Уходит ли IPv6 мимо туннеля.
+
+    Классическая утечка: VPN поднимает только IPv4, а у системы остаётся
+    глобальный IPv6 и маршрут по умолчанию через физический интерфейс. Тогда
+    всё, у чего есть AAAA-запись, идёт открыто, а пробы этого не видят —
+    они уходят тем же путём, что и весь остальной трафик.
+    """
+    tun = cfg["happ"]["tun_interface"]
+    if not iface_exists(tun):
+        return None                      # туннеля нет — утекать нечему
+    interfaces = [name for name in global_ipv6_interfaces() if name != tun]
+    if not interfaces:
+        return None                      # глобального IPv6 у системы нет вовсе
+    outside = [iface for iface, _ in ipv6_default_routes() if iface != tun]
+    if not outside:
+        return None
+    return (f"IPv6 идёт через {', '.join(sorted(set(outside)))} мимо {tun} "
+            f"(глобальный адрес на {', '.join(interfaces)})")
 
 
 def ip_prefix(ip: str) -> str:
@@ -1051,37 +1126,45 @@ def ip_prefix(ip: str) -> str:
 
 
 def check_leak(cfg: dict) -> Check:
-    """Один ли выход у SOCKS и у системного маршрута.
+    """Один ли выход у SOCKS и у системного маршрута — и не утекает ли IPv6.
 
     Самая опасная поломка — не «интернета нет», а «интернет есть мимо
     туннеля»: остальные пробы при этом зелёные, ведь 204 приходит одинаково
     что через VPN, что напрямую. Сравнение внешнего IP по двум путям ловит
-    именно это и не требует знать адреса провайдера.
+    именно это и не требует знать адреса провайдера. Отдельно смотрятся
+    маршруты IPv6: пробой его не поймать, обе пробы ушли бы одним путём.
     """
     name = "Утечка мимо туннеля"
     if not cfg["checks"]["leak_check"]:
         return Check(name, True, "проверка выключена", critical=False)
 
-    def measure() -> tuple[tuple[str | None, str], tuple[str | None, str]]:
-        socks_res, sys_res = _parallel([partial(exit_ip, cfg, via_socks=True),
-                                        partial(exit_ip, cfg, via_socks=False)])
-        return socks_res, sys_res
+    ipv6_problem = ipv6_leaks_outside_tunnel(cfg) if cfg["checks"]["leak_check_ipv6"] else None
+
+    def measure() -> list[tuple[str | None, str]]:
+        return _parallel([partial(exit_ip, cfg, via_socks=True),
+                          partial(exit_ip, cfg, via_socks=False)])
 
     (socks_ip, socks_err), (sys_ip, sys_err) = measure()
     if socks_ip is None or sys_ip is None:
         # Недоступность ловят другие пробы, здесь она означает лишь «не измерили».
-        return Check(name, True, f"не удалось измерить (SOCKS: {socks_err or 'ок'}; "
-                                 f"система: {sys_err or 'ок'})", critical=False)
-    if ip_prefix(socks_ip) == ip_prefix(sys_ip):
-        return Check(name, True, f"выход {sys_ip} по обоим путям")
+        detail = f"не удалось измерить (SOCKS: {socks_err or 'ок'}; система: {sys_err or 'ок'})"
+        if ipv6_problem:
+            return Check(name, False, ipv6_problem)
+        return Check(name, True, detail, critical=False)
 
-    # Расхождение подтверждаем вторым замером: смена сервера ровно между двумя
-    # запросами выглядит так же, а перезапускать VPN из-за неё незачем.
-    (socks_ip2, _), (sys_ip2, _) = measure()
-    if socks_ip2 and sys_ip2 and ip_prefix(socks_ip2) == ip_prefix(sys_ip2):
-        return Check(name, True, f"выход {sys_ip2} по обоим путям (расхождение не подтвердилось)")
-    return Check(name, False, f"система выходит через {sys_ip2 or sys_ip}, "
-                              f"а туннель через {socks_ip2 or socks_ip} — трафик идёт мимо VPN")
+    if ip_prefix(socks_ip) != ip_prefix(sys_ip):
+        # Расхождение подтверждаем вторым замером: смена сервера ровно между
+        # двумя запросами выглядит так же, а перезапускать VPN из-за неё незачем.
+        (socks_ip2, _), (sys_ip2, _) = measure()
+        if not (socks_ip2 and sys_ip2 and ip_prefix(socks_ip2) == ip_prefix(sys_ip2)):
+            return Check(name, False, f"система выходит через {sys_ip2 or sys_ip}, "
+                                      f"а туннель через {socks_ip2 or socks_ip} — "
+                                      "трафик идёт мимо VPN")
+        sys_ip = sys_ip2
+
+    if ipv6_problem:
+        return Check(name, False, ipv6_problem)
+    return Check(name, True, f"выход {sys_ip} по обоим путям, IPv6 мимо туннеля не идёт")
 
 
 def check_expected(cfg: dict) -> list[Check]:

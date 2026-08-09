@@ -261,6 +261,70 @@ class LeakDetection(unittest.TestCase):
         self.cfg["checks"]["leak_check"] = False
         self.assertFalse(w.check_leak(self.cfg).critical)
 
+    def test_ipv6_leak_is_reported_even_when_exit_ip_matches(self):
+        self.fake_measurements([("45.144.53.130", ""), ("45.144.53.130", "")])
+        original = w.ipv6_leaks_outside_tunnel
+        w.ipv6_leaks_outside_tunnel = lambda cfg: "IPv6 идёт через wlo1 мимо tun0"
+        try:
+            check = w.check_leak(self.cfg)
+        finally:
+            w.ipv6_leaks_outside_tunnel = original
+        self.assertFalse(check.ok)
+        self.assertIn("IPv6", check.detail)
+
+
+class IPv6Routing(unittest.TestCase):
+    """IPv6 проверяется маршрутами: сниффинг Happ подменяет адрес назначения
+    доменом из SNI, и пробой семейство не зафиксировать."""
+
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.saved = (w.iface_exists, w.global_ipv6_interfaces, w.ipv6_default_routes)
+        w.iface_exists = lambda name: name == "tun0"
+
+    def tearDown(self):
+        w.iface_exists, w.global_ipv6_interfaces, w.ipv6_default_routes = self.saved
+
+    def test_no_global_ipv6_means_nothing_can_leak(self):
+        w.global_ipv6_interfaces = lambda: []
+        w.ipv6_default_routes = lambda: []
+        self.assertIsNone(w.ipv6_leaks_outside_tunnel(self.cfg))
+
+    def test_ipv6_through_tunnel_is_fine(self):
+        w.global_ipv6_interfaces = lambda: ["tun0"]
+        w.ipv6_default_routes = lambda: [("tun0", 1024)]
+        self.assertIsNone(w.ipv6_leaks_outside_tunnel(self.cfg))
+
+    def test_ipv6_through_physical_interface_is_a_leak(self):
+        w.global_ipv6_interfaces = lambda: ["wlo1"]
+        w.ipv6_default_routes = lambda: [("wlo1", 1024)]
+        problem = w.ipv6_leaks_outside_tunnel(self.cfg)
+        self.assertIsNotNone(problem)
+        self.assertIn("wlo1", problem)
+
+    def test_no_tunnel_means_nothing_to_compare(self):
+        w.iface_exists = lambda name: False
+        w.global_ipv6_interfaces = lambda: ["wlo1"]
+        w.ipv6_default_routes = lambda: [("wlo1", 1024)]
+        self.assertIsNone(w.ipv6_leaks_outside_tunnel(self.cfg))
+
+    def test_route_table_is_parsed_and_lo_stubs_dropped(self):
+        # Как в /proc/net/ipv6_route: сначала ::/0 через lo (заглушка
+        # unreachable с максимальной метрикой), затем настоящий через tun0.
+        zero = "0" * 32
+        rows = [f"{zero} 00 {zero} 00 {zero} ffffffff 00000001 00000000 00200200 lo",
+                f"{zero} 00 {zero} 00 {zero} 00000400 00000000 00000000 00000003 tun0"]
+        path = Path(tempfile.mkdtemp()) / "ipv6_route"
+        path.write_text("\n".join(rows) + "\n")
+        self.assertEqual(w.ipv6_default_routes(path), [("tun0", 1024)])
+
+    def test_interface_table_keeps_only_global_scope(self):
+        rows = ["fe80000000000000aabbccddeeff0011 03 40 20 80 wlo1",   # link-local
+                "2a00000000000000aabbccddeeff0011 04 40 00 80 tun0"]   # глобальный
+        path = Path(tempfile.mkdtemp()) / "if_inet6"
+        path.write_text("\n".join(rows) + "\n")
+        self.assertEqual(w.global_ipv6_interfaces(path), ["tun0"])
+
 
 class ExpectedCodes(unittest.TestCase):
     def setUp(self):

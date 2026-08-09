@@ -117,6 +117,12 @@ DEFAULTS: dict = {
         "kill_orphan_cores": True,
         "orphan_grace": 60,
     },
+    "killswitch": {
+        "enabled": False,
+        "allow_lan": True,
+        "allow_dhcp": True,
+        "remove_on_exit": True,
+    },
     "geo": {
         "autofix": True,
         "check_interval": 1800,
@@ -248,6 +254,17 @@ fix_core_log_level = true     # без уровня логов Happ не пиш�
 core_log_level = "info"
 kill_orphan_cores = true      # xray, переживший свой GUI, держит SOCKS-порт
 orphan_grace = 60             # сколько ждать, прежде чем счесть ядро осиротевшим
+
+[killswitch]
+# Пока выключен. Включённый kill-switch не выпускает трафик наружу мимо туннеля:
+# падение VPN означает «интернета нет», а не «интернет мимо VPN». Нужен
+# беспарольный sudo для nft. Правила можно прочитать заранее:
+# happ-watchdog killswitch show
+enabled = false
+allow_lan = true              # оставить доступ в локальную сеть и к роутеру
+allow_dhcp = true
+remove_on_exit = true         # снимать правила при остановке сторожа, чтобы
+                              # упавший сторож не оставил машину без сети
 
 [geo]
 # Профиль маршрутизации приносит урезанные geo-файлы, и ядро xray не стартует,
@@ -1703,6 +1720,116 @@ def geo_selfcheck(cfg: dict, *, apply_fix: bool = True) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# kill-switch: без туннеля трафик наружу не выпускается
+# --------------------------------------------------------------------------
+
+KILLSWITCH_TABLE = "happ_watchdog"
+PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+                "224.0.0.0/4", "255.255.255.255/32")
+
+
+def killswitch_endpoints(cfg: dict) -> list[tuple[str, int]]:
+    """Адреса серверов VPN, которым нужен прямой выход мимо туннеля.
+
+    Без них подключиться станет невозможно: ядро идёт к серверу напрямую, и
+    правило «только через tun0» отрезало бы саму возможность подняться.
+    """
+    endpoints: list[tuple[str, int]] = []
+    for host, port, _name in collect_servers(cfg):
+        try:
+            socket.inet_aton(host)
+        except OSError:
+            continue                     # доменное имя в правило не поставить
+        if (host, port) not in endpoints:
+            endpoints.append((host, port))
+    return endpoints
+
+
+def killswitch_ruleset(cfg: dict) -> str:
+    """Текст правил nftables. Отдельная функция, чтобы их можно было прочитать
+    глазами до применения — `happ-watchdog killswitch show`."""
+    tun = cfg["happ"]["tun_interface"]
+    lines = [f"table inet {KILLSWITCH_TABLE} {{",
+             "  chain output {",
+             "    type filter hook output priority 0; policy drop;",
+             "    ct state established,related accept",
+             "    oifname \"lo\" accept",
+             f"    oifname \"{tun}\" accept"]
+    if cfg["killswitch"]["allow_lan"]:
+        lines.append("    ip daddr { " + ", ".join(PRIVATE_NETS) + " } accept")
+    for host, port in killswitch_endpoints(cfg):
+        lines.append(f"    ip daddr {host} tcp dport {port} accept")
+        lines.append(f"    ip daddr {host} udp dport {port} accept")
+    if cfg["killswitch"]["allow_dhcp"]:
+        lines.append("    udp dport { 67, 68 } accept")
+    lines += ["  }", "}"]
+    return "\n".join(lines) + "\n"
+
+
+def killswitch_active() -> bool | None:
+    """True/False, либо None — если посмотреть не дали (нет прав)."""
+    proc = subprocess.run(["sudo", "-n", "nft", "list", "tables"],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return None
+    return KILLSWITCH_TABLE in proc.stdout
+
+
+def killswitch_apply(cfg: dict) -> bool:
+    ruleset = killswitch_ruleset(cfg)
+    killswitch_remove(quiet=True)
+    proc = subprocess.run(["sudo", "-n", "nft", "-f", "-"], input=ruleset,
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        log(f"kill-switch не включён: {proc.stderr.strip() or 'нужен беспарольный sudo'}",
+            level="error")
+        return False
+    log(f"kill-switch включён: наружу только через {cfg['happ']['tun_interface']}",
+        level="warn")
+    return True
+
+
+def killswitch_remove(*, quiet: bool = False) -> bool:
+    proc = subprocess.run(["sudo", "-n", "nft", "delete", "table", "inet", KILLSWITCH_TABLE],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        if not quiet:
+            log(f"kill-switch не снят: {proc.stderr.strip() or 'нужен беспарольный sudo'}",
+                level="error")
+        return False
+    if not quiet:
+        log("kill-switch снят, сеть работает как обычно", level="warn")
+    return True
+
+
+def cmd_killswitch(cfg: dict, args: argparse.Namespace) -> int:
+    action = args.action
+    if action == "show":
+        print(c("\n  Правила, которые будут применены:\n", "bold"))
+        print(killswitch_ruleset(cfg))
+        print(c("  Проверить: sudo nft -c -f - <<< '…'\n", "grey"))
+        return 0
+    if action == "status":
+        active = killswitch_active()
+        print("\n  kill-switch: " + {True: c("включён", "yellow"),
+                                     False: "выключен",
+                                     None: "неизвестно (нет беспарольного sudo)"}[active] + "\n")
+        return 0
+    if action == "on":
+        endpoints = killswitch_endpoints(cfg)
+        if not endpoints:
+            print(c("\n  Отказываюсь включать: не известен ни один IP сервера VPN.", "red"))
+            print("  Без него подключиться будет нельзя, а сеть окажется заблокирована.")
+            print("  Выполните happ-watchdog ping при живом VPN и повторите.\n")
+            return 2
+        print(f"\n  Разрешённые серверы: "
+              + ", ".join(f"{h}:{p}" for h, p in endpoints))
+        print("  Снять в любой момент: happ-watchdog killswitch off\n")
+        return 0 if killswitch_apply(cfg) else 1
+    return 0 if killswitch_remove() else 1
+
+
+# --------------------------------------------------------------------------
 # самолечение: устраняем причины, а не симптомы
 # --------------------------------------------------------------------------
 
@@ -2402,6 +2529,9 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     ping_interval = float(cfg["servers"]["ping_interval"])
     quiet = bool(cfg["general"]["quiet_when_healthy"])
 
+    if cfg["killswitch"]["enabled"]:
+        killswitch_apply(cfg)
+
     log(f"{APP} {VERSION} запущен: интервал {interval:.0f} с, "
         f"порог {threshold} сбоя(ев), конфиг {args.config}", level="info")
 
@@ -2552,6 +2682,11 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
                         level="error")
                     recovery.perform("ни один сервер подписки не отвечает")
 
+            if cfg["killswitch"]["enabled"]:
+                # Сервер мог смениться — правила пересобираются под новый адрес,
+                # иначе kill-switch отрежет саму возможность подключиться.
+                killswitch_apply(cfg)
+
             # Данные подписки обновились вместе с пингом: проверяем здесь же.
             subs_problems = subscription_problems(cfg)
             if subs_problems and not state.get("subs_notice"):
@@ -2570,6 +2705,11 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
             log(f"цикл проверок занял {elapsed:.0f} с при интервале {interval:.0f} с",
                 level="warn")
         stop.wait(max(1.0, interval - elapsed))
+
+    if cfg["killswitch"]["enabled"] and cfg["killswitch"]["remove_on_exit"]:
+        # Иначе остановленный сторож оставит машину без сети, и разбираться
+        # придётся руками через nft.
+        killswitch_remove(quiet=True)
 
     log("остановлен", level="info")
     lock.close()
@@ -2647,6 +2787,7 @@ def main() -> int:
         "status": (cmd_status, "состояние сторожа"),
         "stats": (cmd_stats, "сводка по журналу (например: stats 24h)"),
         "doctor": (cmd_doctor, "один отчёт обо всём сразу для разбора поломки"),
+        "killswitch": (cmd_killswitch, "не выпускать трафик мимо туннеля (on/off/show/status)"),
         "pause": (cmd_pause, "не вмешиваться какое-то время (например: pause 30m)"),
         "resume": (cmd_resume, "снять паузу"),
         "install-service": (cmd_install_service, "поставить автозапуск через systemd --user"),
@@ -2657,6 +2798,10 @@ def main() -> int:
         if name == "pause":
             parser_sub.add_argument("duration", nargs="?", default="30m",
                                     help="длительность: 90s, 30m, 2h, 1d (по умолчанию 30m)")
+        if name == "killswitch":
+            parser_sub.add_argument("action", nargs="?", default="status",
+                                    choices=["on", "off", "show", "status"],
+                                    help="on — включить, off — снять, show — показать правила")
         if name == "stats":
             parser_sub.add_argument("period", nargs="?", default="24h",
                                     help="за какой срок: 2h, 24h, 7d (по умолчанию 24h)")

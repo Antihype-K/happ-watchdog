@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -415,6 +416,48 @@ class SubscriptionStatus(unittest.TestCase):
     def test_human_bytes(self):
         self.assertEqual(w.human_bytes(536870912000), "500 ГБ")
         self.assertEqual(w.human_bytes(0), "0 Б")
+
+
+class KillSwitchRules(unittest.TestCase):
+    """Правила собираются без применения — их можно прочитать глазами."""
+
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.saved = w.collect_servers
+        w.collect_servers = lambda cfg: [("144.31.90.41", 443, "активный"),
+                                         ("vpn.example.com", 443, "по имени")]
+
+    def tearDown(self):
+        w.collect_servers = self.saved
+
+    def test_only_ip_endpoints_get_into_rules(self):
+        # Доменное имя в правило не поставить: nft хочет адрес.
+        self.assertEqual(w.killswitch_endpoints(self.cfg), [("144.31.90.41", 443)])
+
+    def test_ruleset_drops_by_default_and_allows_tunnel(self):
+        rules = w.killswitch_ruleset(self.cfg)
+        self.assertIn("policy drop", rules)
+        self.assertIn('oifname "tun0" accept', rules)
+        self.assertIn('oifname "lo" accept', rules)
+
+    def test_vpn_server_stays_reachable(self):
+        # Без этого правила подняться будет нельзя: ядро идёт к серверу напрямую.
+        rules = w.killswitch_ruleset(self.cfg)
+        self.assertIn("ip daddr 144.31.90.41 tcp dport 443 accept", rules)
+        self.assertIn("ip daddr 144.31.90.41 udp dport 443 accept", rules)
+
+    def test_lan_can_be_excluded(self):
+        self.cfg["killswitch"]["allow_lan"] = False
+        self.assertNotIn("192.168.0.0/16", w.killswitch_ruleset(self.cfg))
+
+    def test_custom_tun_name(self):
+        self.cfg["happ"]["tun_interface"] = "happ0"
+        self.assertIn('oifname "happ0" accept', w.killswitch_ruleset(self.cfg))
+
+    def test_refuses_to_lock_the_machine_without_server_ip(self):
+        w.collect_servers = lambda cfg: []
+        args = argparse.Namespace(action="on")
+        self.assertEqual(w.cmd_killswitch(self.cfg, args), 2)
 
 
 class Webhook(unittest.TestCase):

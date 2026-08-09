@@ -617,11 +617,16 @@ def xray_endpoints(min_share: float = 0.5, min_conns: int = 2,
 # --------------------------------------------------------------------------
 
 class Happ:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, stop: threading.Event | None = None):
         self.binary = cfg["happ"]["binary"]
         self.cfg = cfg
+        # Событие остановки: все ожидания идут через него, иначе SIGTERM не
+        # прерывает паузы и systemd добивает сторожа по TimeoutStopSec.
+        self.stop = stop or threading.Event()
 
     def deeplink(self, link: str, timeout: float = 20.0) -> bool:
+        if self.stop.is_set():
+            return False                 # сторожа останавливают — не дёргаем Happ
         if not Path(self.binary).exists():
             log(f"не найден бинарник Happ: {self.binary}", level="error")
             return False
@@ -654,13 +659,15 @@ class Happ:
                 pass
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and pids_matching(self.binary):
-            time.sleep(0.5)
+            if self.stop.wait(0.5):
+                return False
         for pid in pids_matching(self.binary):
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-        time.sleep(1.5)
+        if self.stop.wait(1.5):
+            return False
         try:
             subprocess.Popen(["setsid", self.binary],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -668,7 +675,7 @@ class Happ:
         except OSError as exc:
             log(f"не удалось запустить Happ: {exc}", level="error")
             return False
-        time.sleep(6)
+        self.stop.wait(6)
         return self.gui_running()
 
     def restart_daemon(self) -> bool:
@@ -683,7 +690,7 @@ class Happ:
         if proc.returncode != 0:
             log(f"перезапуск {service} отклонён (нужен беспарольный sudo)", level="warn")
             return False
-        time.sleep(3)
+        self.stop.wait(3)
         return True
 
 
@@ -1259,10 +1266,12 @@ def save_state(state: dict) -> None:
 
 
 class Recovery:
-    def __init__(self, cfg: dict, happ: Happ, state: dict):
+    def __init__(self, cfg: dict, happ: Happ, state: dict,
+                 stop: threading.Event | None = None):
         self.cfg = cfg
         self.happ = happ
         self.state = state
+        self.stop = stop or threading.Event()
 
     def escalations_limited(self) -> bool:
         """Квота считается только для разрушительных шагов — они убивают процесс
@@ -1287,6 +1296,8 @@ class Recovery:
         return "cycle", "повторный цикл disconnect → connect"
 
     def perform(self, reason: str) -> bool:
+        if self.stop.is_set():
+            return False                 # сторожа останавливают — не начинаем лечение
         ladder = int(self.state.get("ladder", 0))
         kind, step = self.plan(ladder)
 
@@ -1311,18 +1322,18 @@ class Recovery:
             self.happ.connect()
         elif kind == "cycle":
             self.happ.disconnect()
-            time.sleep(3)
+            self.stop.wait(3)
             self.happ.connect()
         elif kind == "gui":
             self.happ.disconnect()
-            time.sleep(2)
+            self.stop.wait(2)
             self.happ.restart_gui()
-            time.sleep(2)
+            self.stop.wait(2)
             self.happ.connect()
         else:
             self.happ.restart_daemon()
             self.happ.restart_gui()
-            time.sleep(2)
+            self.stop.wait(2)
             self.happ.connect()
 
         recovered = self.verify()
@@ -1339,7 +1350,7 @@ class Recovery:
                 level="error")
             if self.cfg["general"]["notify"] and ladder == 1:
                 notify("Happ: VPN не поднимается", reason[:160], urgency="critical")
-            time.sleep(pause)
+            self.stop.wait(pause)
         save_state(self.state)
         return recovered
 
@@ -1355,7 +1366,8 @@ class Recovery:
     def verify(self) -> bool:
         deadline = time.monotonic() + float(self.cfg["general"]["verify_timeout"])
         while time.monotonic() < deadline:
-            time.sleep(3)
+            if self.stop.wait(3):
+                return False             # остановка важнее: дождёмся следующего запуска
             health = run_health(self.cfg, include_logs=False)
             if health.ok:
                 return True
@@ -1490,19 +1502,19 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
         print("  Второй экземпляр запускать нельзя: они будут дёргать VPN наперегонки.")
         return 1
 
-    happ = Happ(cfg)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    happ = Happ(cfg, stop)
     state = load_state()
     state["ladder"] = 0
-    recovery = Recovery(cfg, happ, state)
+    recovery = Recovery(cfg, happ, state, stop)
     interval = float(cfg["general"]["interval"])
     threshold = int(cfg["general"]["failures_before_restart"])
     startup_grace = float(cfg["general"]["startup_grace"])
     ping_interval = float(cfg["servers"]["ping_interval"])
     quiet = bool(cfg["general"]["quiet_when_healthy"])
-
-    stop = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     log(f"{APP} {VERSION} запущен: интервал {interval:.0f} с, "
         f"порог {threshold} сбоя(ев), конфиг {args.config}", level="info")
@@ -1587,12 +1599,18 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
         state["last_status"] = status
         save_state(state)
 
+        if stop.is_set():
+            break            # дальше идут долгие фоновые задачи — они подождут до запуска
+
         if time.monotonic() >= next_geo:
             next_geo = time.monotonic() + geo_interval
             try:
                 geo_selfcheck(cfg)
             except Exception as exc:  # noqa: BLE001 — сторож не должен падать из-за этого
                 log(f"проверка geo-файлов не удалась: {type(exc).__name__}: {exc}", level="warn")
+
+        if stop.is_set():
+            break
 
         if time.monotonic() >= next_ping:
             next_ping = time.monotonic() + ping_interval
@@ -1632,6 +1650,7 @@ Type=simple
 ExecStart={python} {script} run
 Restart=always
 RestartSec=10
+TimeoutStopSec=30
 {environment}
 
 [Install]

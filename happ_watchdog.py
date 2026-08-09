@@ -85,7 +85,8 @@ DEFAULTS: dict = {
         "leak_check": True,
         "leak_host": "cp.cloudflare.com",
         "leak_path": "/cdn-cgi/trace",
-        "expect": [{"host": "api.anthropic.com", "path": "/", "code": 404}],
+        "expect": [{"host": "api.anthropic.com", "path": "/", "code": 404,
+                    "critical": False}],
         "dns_timeout": 4.0,
         "tcp_timeout": 8.0,
         "scan_logs": True,
@@ -193,10 +194,15 @@ log_window = 120              # окно в секундах
 # Адреса, у которых признаком здоровья считается конкретный код ответа.
 # api.anthropic.com на GET / штатно отвечает 404 — другой код означает, что
 # в середину кто-то вмешался. Блоков можно добавить сколько угодно.
+#
+# critical = false: один внешний адрес не должен в одиночку означать «VPN
+# сломан». Такая проба зависит от чужой доступности и способна моргнуть сама
+# по себе — в выводе и журнале она видна, но перезапуск VPN не запускает.
 [[checks.expect]]
 host = "api.anthropic.com"
 path = "/"
 code = 404
+critical = false
 
 [geo]
 # Профиль маршрутизации приносит урезанные geo-файлы, и ядро xray не стартует,
@@ -1036,7 +1042,8 @@ def check_expected(cfg: dict) -> list[Check]:
     results = _parallel([partial(http_probe, item["host"], item.get("path", "/"), timeout,
                                  via_socks=None, expect_code=int(item["code"]))
                          for item in items])
-    return [Check(f"{item['host']} → ждём {int(item['code'])}", ok, detail, ms)
+    return [Check(f"{item['host']} → ждём {int(item['code'])}", ok, detail, ms,
+                  critical=bool(item.get("critical", True)))
             for item, (ok, detail, ms) in zip(items, results)]
 
 

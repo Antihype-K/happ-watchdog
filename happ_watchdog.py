@@ -82,6 +82,9 @@ DEFAULTS: dict = {
         "dns_domains": ["cloudflare.com", "github.com"],
         "dns_servers": ["1.1.1.1", "8.8.8.8"],
         "system_dns_domains": ["www.youtube.com"],
+        "leak_check": True,
+        "leak_host": "cp.cloudflare.com",
+        "leak_path": "/cdn-cgi/trace",
         "expect": [{"host": "api.anthropic.com", "path": "/", "code": 404}],
         "dns_timeout": 4.0,
         "tcp_timeout": 8.0,
@@ -165,6 +168,14 @@ dns_servers = ["1.1.1.1", "8.8.8.8"]
 # путь, которым ходит браузер. Если DNS уйдёт мимо туннеля, в браузере
 # перестанут открываться сайты, хотя туннель будет выглядеть живым.
 system_dns_domains = ["www.youtube.com"]
+
+# Утечка мимо туннеля. Внешний IP спрашивается дважды — через SOCKS и через
+# системный маршрут; разные сети означают, что трафик системы идёт открыто,
+# хотя туннель при этом выглядит живым (204 приходит по обоим путям одинаково).
+leak_check = true
+leak_host = "cp.cloudflare.com"
+leak_path = "/cdn-cgi/trace"
+
 dns_timeout = 4.0
 tcp_timeout = 8.0
 scan_logs = true              # искать всплески ошибок в логах Happ
@@ -376,13 +387,12 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return buf
 
 
-def http_probe(host: str, path: str, timeout: float, *, via_socks: tuple[str, int] | None,
-               port: int = 443, expect_code: int | None = None) -> tuple[bool, str, float]:
-    """TLS + HTTP GET. Возвращает (успех, описание, миллисекунды).
+def _https_get(host: str, path: str, timeout: float, via_socks: tuple[str, int] | None,
+               port: int = 443, *, read_all: bool = False) -> tuple[str, float]:
+    """TLS + GET. Возвращает (ответ, миллисекунды); при любой сетевой беде бросает.
 
-    expect_code задаёт точный ожидаемый ответ: для некоторых адресов «неудобный»
-    код и есть признак здоровья. api.anthropic.com на GET / отвечает 404 — если
-    вместо него пришло что-то другое, значит в середине кто-то вмешался.
+    read_all=False читает один recv — этого хватает на строку статуса и стоит
+    меньше всего. read_all=True дочитывает тело: оно нужно проверке утечки.
     """
     t0 = time.monotonic()
     sock = None
@@ -392,14 +402,39 @@ def http_probe(host: str, path: str, timeout: float, *, via_socks: tuple[str, in
         else:
             sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(timeout)
-        ctx = ssl.create_default_context()
-        tls = ctx.wrap_socket(sock, server_hostname=host)
+        tls = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
         sock = tls
         req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
                "User-Agent: happ-watchdog\r\nConnection: close\r\nAccept: */*\r\n\r\n")
         tls.sendall(req.encode())
-        head = tls.recv(256).decode("latin-1", "replace")
-        ms = (time.monotonic() - t0) * 1000
+        if not read_all:
+            return tls.recv(256).decode("latin-1", "replace"), (time.monotonic() - t0) * 1000
+        buf = b""
+        while len(buf) < 8192:
+            chunk = tls.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode("utf-8", "replace"), (time.monotonic() - t0) * 1000
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def http_probe(host: str, path: str, timeout: float, *, via_socks: tuple[str, int] | None,
+               port: int = 443, expect_code: int | None = None) -> tuple[bool, str, float]:
+    """TLS + HTTP GET. Возвращает (успех, описание, миллисекунды).
+
+    expect_code задаёт точный ожидаемый ответ: для некоторых адресов «неудобный»
+    код и есть признак здоровья. api.anthropic.com на GET / отвечает 404 — если
+    вместо него пришло что-то другое, значит в середине кто-то вмешался.
+    """
+    t0 = time.monotonic()
+    try:
+        head, ms = _https_get(host, path, timeout, via_socks, port)
         status = head.split("\r\n", 1)[0]
         code = 0
         parts = status.split()
@@ -414,12 +449,6 @@ def http_probe(host: str, path: str, timeout: float, *, via_socks: tuple[str, in
         return False, f"неожиданный ответ: {status[:60]}", ms
     except Exception as exc:  # noqa: BLE001 — любая сетевая беда = проба провалена
         return False, f"{host}: {type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
 
 
 def dns_query(server: str, domain: str, timeout: float) -> tuple[bool, str, float]:
@@ -938,6 +967,68 @@ def check_system_dns(cfg: dict) -> Check:
                  "; ".join(errors[:2]) + " — похоже, DNS идёт мимо туннеля")
 
 
+def exit_ip(cfg: dict, *, via_socks: bool) -> tuple[str | None, str]:
+    """Внешний IP, каким его видит сервер, — по SOCKS или по системному маршруту."""
+    host = cfg["checks"]["leak_host"]
+    path = cfg["checks"]["leak_path"]
+    timeout = float(cfg["checks"]["tcp_timeout"])
+    proxy = (cfg["happ"]["socks_host"], int(cfg["happ"]["socks_port"])) if via_socks else None
+    try:
+        body, _ = _https_get(host, path, timeout, proxy, read_all=True)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+    for line in body.splitlines():
+        if line.startswith("ip="):
+            return line[3:].strip(), ""
+    return None, "в ответе нет строки ip="
+
+
+def ip_prefix(ip: str) -> str:
+    """Сеть, в которой живёт адрес: /24 для IPv4, /48 для IPv6.
+
+    Провайдер VPN может выпускать трафик через пул соседних адресов, и точное
+    сравнение дало бы ложную тревогу. Утечка же выглядит совсем иначе — адрес
+    оказывается из сети домашнего провайдера, а это другой префикс.
+    """
+    if ":" in ip:
+        return ":".join(ip.split(":")[:3])
+    return ".".join(ip.split(".")[:3])
+
+
+def check_leak(cfg: dict) -> Check:
+    """Один ли выход у SOCKS и у системного маршрута.
+
+    Самая опасная поломка — не «интернета нет», а «интернет есть мимо
+    туннеля»: остальные пробы при этом зелёные, ведь 204 приходит одинаково
+    что через VPN, что напрямую. Сравнение внешнего IP по двум путям ловит
+    именно это и не требует знать адреса провайдера.
+    """
+    name = "Утечка мимо туннеля"
+    if not cfg["checks"]["leak_check"]:
+        return Check(name, True, "проверка выключена", critical=False)
+
+    def measure() -> tuple[tuple[str | None, str], tuple[str | None, str]]:
+        socks_res, sys_res = _parallel([partial(exit_ip, cfg, via_socks=True),
+                                        partial(exit_ip, cfg, via_socks=False)])
+        return socks_res, sys_res
+
+    (socks_ip, socks_err), (sys_ip, sys_err) = measure()
+    if socks_ip is None or sys_ip is None:
+        # Недоступность ловят другие пробы, здесь она означает лишь «не измерили».
+        return Check(name, True, f"не удалось измерить (SOCKS: {socks_err or 'ок'}; "
+                                 f"система: {sys_err or 'ок'})", critical=False)
+    if ip_prefix(socks_ip) == ip_prefix(sys_ip):
+        return Check(name, True, f"выход {sys_ip} по обоим путям")
+
+    # Расхождение подтверждаем вторым замером: смена сервера ровно между двумя
+    # запросами выглядит так же, а перезапускать VPN из-за неё незачем.
+    (socks_ip2, _), (sys_ip2, _) = measure()
+    if socks_ip2 and sys_ip2 and ip_prefix(socks_ip2) == ip_prefix(sys_ip2):
+        return Check(name, True, f"выход {sys_ip2} по обоим путям (расхождение не подтвердилось)")
+    return Check(name, False, f"система выходит через {sys_ip2 or sys_ip}, "
+                              f"а туннель через {socks_ip2 or socks_ip} — трафик идёт мимо VPN")
+
+
 def check_expected(cfg: dict) -> list[Check]:
     """Адреса, у которых здоровьем считается конкретный код ответа."""
     items = list(cfg["checks"]["expect"])
@@ -1029,6 +1120,7 @@ def run_health(cfg: dict, *, include_logs: bool = True) -> Health:
         tasks.append(("Системный путь (через tun)", partial(check_proxy, cfg, via_socks=False)))
     tasks += [("DNS", partial(check_dns, cfg)),
               ("Системный DNS (браузер)", partial(check_system_dns, cfg)),
+              ("Утечка мимо туннеля", partial(check_leak, cfg)),
               ("Ожидаемые коды ответа", partial(check_expected, cfg))]
     if include_logs and cfg["checks"]["scan_logs"]:
         tasks.append(("Логи ядра Happ", partial(check_happ_logs, cfg)))

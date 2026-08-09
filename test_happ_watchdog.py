@@ -167,6 +167,54 @@ class Escalation(unittest.TestCase):
         self.assertEqual(self.state["restarts"], [])              # история не тронута
 
 
+class CrashDetection(unittest.TestCase):
+    """Падение Happ отличается от выхода по кнопке следами работавшего туннеля."""
+
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.saved = (w.XRAY_PATH_HINT, w.SINGBOX_PATH_HINT, w.iface_exists)
+        w.XRAY_PATH_HINT = "нет-такого-процесса-xray"
+        w.SINGBOX_PATH_HINT = "нет-такого-процесса-singbox"
+        w.iface_exists = lambda name: False
+
+    def tearDown(self):
+        w.XRAY_PATH_HINT, w.SINGBOX_PATH_HINT, w.iface_exists = self.saved
+
+    def test_clean_exit_leaves_nothing(self):
+        self.assertEqual(w.leftovers_after_gui(self.cfg), [])
+
+    def test_live_tun_is_evidence_of_a_crash(self):
+        w.iface_exists = lambda name: name == self.cfg["happ"]["tun_interface"]
+        self.assertEqual(w.leftovers_after_gui(self.cfg), ["интерфейс tun0 на месте"])
+
+    def test_quota_stops_endless_resurrection(self):
+        # Happ, падающий сразу после старта, нельзя поднимать по кругу.
+        state = {"escalations": [time.time()] * self.cfg["recovery"]["max_escalations_per_hour"]}
+        happ = w.Happ(self.cfg)
+        happ.start_gui = lambda: self.fail("поднимать Happ было нельзя")
+        recovery = w.Recovery(self.cfg, happ, state)
+        self.assertFalse(recovery.restart_crashed_gui("ядро xray живо"))
+        self.assertTrue(state["crash_notice"])
+
+    def test_stop_prevents_resurrection(self):
+        stop = threading.Event()
+        stop.set()
+        happ = w.Happ(self.cfg, stop)
+        happ.start_gui = lambda: self.fail("поднимать Happ было нельзя")
+        recovery = w.Recovery(self.cfg, happ, {}, stop)
+        self.assertFalse(recovery.restart_crashed_gui("ядро xray живо"))
+
+    def test_resurrection_counts_as_a_hard_step(self):
+        state: dict = {}
+        happ = w.Happ(self.cfg)
+        happ.start_gui = lambda: True
+        happ.connect = lambda: True
+        recovery = w.Recovery(self.cfg, happ, state)
+        recovery.verify = lambda: True
+        self.assertTrue(recovery.restart_crashed_gui("ядро xray живо"))
+        self.assertEqual(len(state["escalations"]), 1)
+
+
 class LeakDetection(unittest.TestCase):
     def setUp(self):
         self.cfg = default_cfg()

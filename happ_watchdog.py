@@ -121,6 +121,8 @@ DEFAULTS: dict = {
         "timeout": 2.0,
     },
     "recovery": {
+        "restart_gui_on_crash": True,
+        "crash_grace": 30,
         "max_escalations_per_hour": 4,
         "soft_retry_interval": 300,
         "backoff": [10, 30, 60, 120],
@@ -241,6 +243,12 @@ timeout = 2.0
 # Мягкие попытки (connect, disconnect+connect) не ограничены: бросать VPN
 # лежащим сторож не должен. Квота — только на жёсткие шаги, которые убивают
 # процесс Happ или демон; исчерпав её, сторож продолжает мягкими попытками.
+
+# Happ, пропавший вместе с живыми ядрами и tun-интерфейсом, не закрыт, а упал:
+# аккуратный выход снимает и то, и другое. Такой Happ сторож поднимает сам.
+restart_gui_on_crash = true
+crash_grace = 30              # сколько ждать, прежде чем счесть пропажу падением
+
 max_escalations_per_hour = 4
 soft_retry_interval = 300     # пауза между попытками, когда лестница пройдена
 backoff = [10, 30, 60, 120]   # пауза перед следующей попыткой, по ступеням
@@ -889,6 +897,23 @@ def check_uplink(cfg: dict) -> Check:
             return Check("Аплинк (физическая сеть)", True, f"{iface} → {gw} (icmp)",
                          (time.monotonic() - t0) * 1000)
     return Check("Аплинк (физическая сеть)", False, f"{iface}: шлюз {gw} недоступен")
+
+
+def leftovers_after_gui(cfg: dict) -> list[str]:
+    """Следы работавшего туннеля, пережившие GUI.
+
+    Выход из Happ по кнопке снимает ядра и убирает tun-интерфейс. Если процесса
+    нет, а они на месте — Happ не закрыли, он упал, и поднимать его надо самим.
+    """
+    signs = []
+    if pids_matching(XRAY_PATH_HINT):
+        signs.append("ядро xray живо")
+    if pids_matching(SINGBOX_PATH_HINT):
+        signs.append("sing-box жив")
+    tun = cfg["happ"]["tun_interface"]
+    if iface_exists(tun):
+        signs.append(f"интерфейс {tun} на месте")
+    return signs
 
 
 def check_processes(cfg: dict) -> Check:
@@ -1722,6 +1747,41 @@ class Recovery:
         save_state(self.state)
         return recovered
 
+    def restart_crashed_gui(self, evidence: str) -> bool:
+        """Поднять Happ, который не закрыли, а который упал.
+
+        Считается жёстким шагом и тратит ту же квоту: если Happ падает сразу
+        после старта, поднимать его по кругу бессмысленно и вредно.
+        """
+        if self.stop.is_set():
+            return False
+        if self.escalations_limited():
+            if not self.state.get("crash_notice"):
+                log("Happ падает чаще, чем позволяет квота жёстких перезапусков — "
+                    "больше не поднимаю, разбирайтесь руками", level="error")
+                self.state["crash_notice"] = True
+            return False
+
+        self.state.setdefault("escalations", []).append(time.time())
+        save_state(self.state)
+        log(f"Happ пропал, но {evidence} — это падение, а не выход по кнопке; поднимаю",
+            level="error")
+        if not self.happ.start_gui():
+            log("Happ не поднялся", level="error")
+            return False
+        self.stop.wait(3)
+        self.happ.connect()
+        recovered = self.verify()
+        if recovered:
+            log("Happ поднят после падения, связь есть", level="ok")
+            self.state["crash_notice"] = False
+            if self.cfg["general"]["notify"]:
+                notify("Happ: восстановлен после падения", evidence[:160])
+        else:
+            log("Happ поднят, но связи нет", level="warn")
+        save_state(self.state)
+        return recovered
+
     def next_pause(self, ladder: int) -> float:
         """Пока лестница не пройдена — короткие паузы из backoff. Дальше сторож
         переходит в редкий фоновый режим: сбой явно не лечится перезапуском,
@@ -2042,6 +2102,8 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     last_status = None
     gui_absent = False           # видели ли мы Happ выключенным
     grace_until = 0.0            # до этого момента Happ считается поднимающимся
+    crash_since: float | None = None
+    crash_grace = float(cfg["recovery"]["crash_grace"])
     next_ping = time.monotonic() + 5 if ping_interval > 0 else float("inf")
     geo_interval = float(cfg["geo"]["check_interval"]) if cfg["geo"]["autofix"] else 0
     next_geo = time.monotonic() if geo_interval > 0 else float("inf")
@@ -2067,16 +2129,30 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
         if cfg["general"]["only_when_gui_running"] and not happ.gui_running():
             fails = 0
             gui_absent = True
-            status = "Happ не запущен"
+            leftovers = (leftovers_after_gui(cfg)
+                         if cfg["recovery"]["restart_gui_on_crash"] else [])
+            if leftovers:
+                if crash_since is None:
+                    crash_since = time.monotonic()   # даём закрывающемуся Happ доубраться
+                elif time.monotonic() - crash_since >= crash_grace:
+                    crash_since = None
+                    recovery.restart_crashed_gui("; ".join(leftovers))
+                    continue
+                status = "Happ пропал, следы туннеля остались"
+            else:
+                crash_since = None
+                status = "Happ не запущен"
             if last_status != status:
-                log("Happ не запущен — считаю, что VPN выключен намеренно, не вмешиваюсь",
-                    level="info")
+                log("Happ не запущен — считаю, что VPN выключен намеренно, не вмешиваюсь"
+                    if not leftovers else f"Happ пропал, но {'; '.join(leftovers)} — "
+                    f"жду {crash_grace:.0f} с и поднимаю, если это падение", level="info")
             last_status = status
             state["last_status"] = status
             save_state(state)
             stop.wait(interval)
             continue
 
+        crash_since = None
         if gui_absent:
             # Happ только что подняли: ядро и tun появляются секунд за двадцать,
             # и дёргать connect в этот момент — драться с его же запуском.

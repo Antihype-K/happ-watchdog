@@ -939,25 +939,45 @@ def _tail_lines(path: Path, limit: int) -> list[str]:
         return []
 
 
+def _guarded(name: str, task):
+    """Проверка, упавшая с исключением, — это баг сторожа, а не диагноз туннелю.
+
+    Раньше такое исключение проходило сквозь run_health и роняло процесс:
+    сторож «сам падал», а systemd поднимал его заново. Теперь проверка
+    превращается в некритичную запись — VPN из-за ошибки в коде не дёргаем,
+    но в журнале это видно каждый раз.
+    """
+    def run() -> Check:
+        try:
+            return task()
+        except Exception as exc:  # noqa: BLE001 — падать сторож не имеет права
+            log(f"проверка «{name}» упала: {type(exc).__name__}: {exc}", level="error")
+            return Check(name, False, f"проверка упала: {type(exc).__name__}: {exc}",
+                         critical=False)
+    return run
+
+
 def run_health(cfg: dict, *, include_logs: bool = True) -> Health:
     health = Health()
     if cfg["uplink"]["check"]:
-        uplink = check_uplink(cfg)
+        uplink = _guarded("Аплинк (физическая сеть)", partial(check_uplink, cfg))()
         health.checks.append(uplink)
-        if not uplink.ok:
+        if not uplink.ok and uplink.critical:
             health.uplink_down = True
             return health                # физической сети нет — VPN дёргать бессмысленно
     # Проверки независимы друг от друга, поэтому идут одновременно: цикл должен
     # укладываться в `interval`, даже когда всё вокруг отвечает таймаутами.
-    tasks = [partial(check_processes, cfg), partial(check_proxy, cfg, via_socks=True)]
+    tasks = [("Процессы и туннель", partial(check_processes, cfg)),
+             ("SOCKS", partial(check_proxy, cfg, via_socks=True))]
     if cfg["checks"]["check_direct_path"]:
-        tasks.append(partial(check_proxy, cfg, via_socks=False))
-    tasks += [partial(check_dns, cfg), partial(check_system_dns, cfg),
-              partial(check_expected, cfg)]
+        tasks.append(("Системный путь (через tun)", partial(check_proxy, cfg, via_socks=False)))
+    tasks += [("DNS", partial(check_dns, cfg)),
+              ("Системный DNS (браузер)", partial(check_system_dns, cfg)),
+              ("Ожидаемые коды ответа", partial(check_expected, cfg))]
     if include_logs and cfg["checks"]["scan_logs"]:
-        tasks.append(partial(check_happ_logs, cfg))
+        tasks.append(("Логи ядра Happ", partial(check_happ_logs, cfg)))
 
-    for result in _parallel(tasks):
+    for result in _parallel([_guarded(name, task) for name, task in tasks]):
         if isinstance(result, list):      # check_expected возвращает список
             health.checks.extend(result)
         else:

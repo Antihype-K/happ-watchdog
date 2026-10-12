@@ -1015,7 +1015,14 @@ def check_processes(cfg: dict) -> Check:
     detail = (f"xray={xray[0] if xray else '-'} sing-box={singbox[0] if singbox else '-'} "
               f"{tun_name}={tun_ip or '-'}")
     if problems:
-        return Check("Процессы и туннель", False, ", ".join(problems))
+        detail = ", ".join(problems)
+        if xray and not singbox and not tun_ip:
+            # Ядро живо, а TUN-половины нет вовсе: Happ подключён в режиме
+            # прокси. Через VPN тогда идёт только SOCKS, остальная система —
+            # напрямую, и это видно по проверке утечки.
+            detail += (" — Happ подключён без TUN, через VPN идёт только SOCKS; "
+                       "включите в Happ режим TUN")
+        return Check("Процессы и туннель", False, detail)
     return Check("Процессы и туннель", True, detail)
 
 
@@ -1041,6 +1048,10 @@ def check_proxy(cfg: dict, *, via_socks: bool) -> Check:
         else:
             errors.append(detail)
     if passed >= quorum:
+        if not via_socks and not iface_exists(cfg["happ"]["tun_interface"]):
+            # Без tun-интерфейса 204 приходит напрямую через провайдера: сеть
+            # жива, но это не VPN, и голое «OK» тут вводит в заблуждение.
+            first_ok = f"{first_ok} — {cfg['happ']['tun_interface']} нет, это прямой выход"
         return Check(name, True, first_ok, best_ms)
     return Check(name, False, "; ".join(errors[:2]) or "нет ответа", best_ms)
 
@@ -1481,11 +1492,25 @@ def subscription_status(cfg: dict) -> list[tuple[str, dict[str, int], str]]:
     цикл пинга.
     """
     result = []
+    seen: set[tuple[str, tuple]] = set()
     for url, entry in _subs_cache().items():
         info = parse_userinfo(entry.get("userinfo", ""))
-        if info:
-            result.append((entry.get("title") or mask_url(url), info, url))
+        if not info:
+            continue
+        title = entry.get("title") or mask_url(url)
+        # Одна подписка часто висит в логе Happ под несколькими URL (зеркала,
+        # разные параметры) — в отчёте это одна и та же строка дважды.
+        key = (title, tuple(sorted(info.items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((title, info, url))
     return result
+
+
+def subscription_expired(info: dict[str, int]) -> bool:
+    expire = info.get("expire", 0)
+    return bool(expire) and expire <= time.time()
 
 
 def subscription_problems(cfg: dict) -> list[str]:
@@ -1497,12 +1522,19 @@ def subscription_problems(cfg: dict) -> list[str]:
     days = float(cfg["servers"]["warn_days_before_expire"])
     ratio = float(cfg["servers"]["warn_traffic_ratio"])
     problems = []
-    for title, info, _url in subscription_status(cfg):
+    status = subscription_status(cfg)
+    # URL подписок берутся из лога Happ, а там остаются и брошенные: старый
+    # провайдер, истёкший месяцы назад, вечно красил бы проверку в «СБОЙ».
+    # Пока есть живая подписка, истёкшая — это остаток, а не беда.
+    has_alive = any(not subscription_expired(info) for _t, info, _u in status)
+    for title, info, _url in status:
         expire = info.get("expire", 0)
         if expire:
             left = expire - time.time()
             if left <= 0:
-                problems.append(f"{title}: подписка истекла")
+                if not has_alive:
+                    problems.append(f"{title}: подписка истекла")
+                continue
             elif left < days * 86400:
                 problems.append(f"{title}: осталось {left / 86400:.1f} дн.")
         total = info.get("total", 0)
@@ -1534,6 +1566,8 @@ def check_subscription(cfg: dict) -> Check:
         return Check(name, False, "; ".join(problems), critical=False)
     details = []
     for title, info, _url in status:
+        if subscription_expired(info):
+            continue                     # брошенная: см. subscription_problems
         left = (info.get("expire", 0) - time.time()) / 86400 if info.get("expire") else None
         used = human_bytes(info.get("download", 0) + info.get("upload", 0))
         total = info.get("total", 0)
@@ -2427,9 +2461,13 @@ def cmd_doctor(cfg: dict, args: argparse.Namespace) -> int:
         used = human_bytes(info.get("download", 0) + info.get("upload", 0))
         total = info.get("total", 0)
         left = (info.get("expire", 0) - time.time()) / 86400 if info.get("expire") else None
+        if left is not None and left <= 0:
+            when = f"истекла {-left:.0f} дн. назад"
+        else:
+            when = f"осталось {left:.0f} дн." if left else ""
         print(f"    {title} ({mask_url(url)}): {used}"
               + (f" из {human_bytes(total)}" if total else " (без лимита)")
-              + (f", осталось {left:.0f} дн." if left else ""))
+              + (f", {when}" if when else ""))
 
     section("Настройки Happ и профиль маршрутизации")
     problems = happ_settings_problems(cfg)
@@ -2551,6 +2589,7 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
 
     while not stop.is_set():
         started = time.monotonic()
+        treated = 0.0            # время лечения: оно ждёт verify и backoff намеренно
 
         pause_end = paused_until()
         if pause_end:
@@ -2640,7 +2679,9 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
                     cfg, f"Happ: VPN лежит {(time.time() - down_since) / 60:.0f} мин — "
                          f"{health.reason()[:300]}")
             if fails >= threshold:
+                t0 = time.monotonic()
                 recovery.perform(health.reason())
+                treated += time.monotonic() - t0
                 fails = 0
 
         last_status = status
@@ -2680,7 +2721,9 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
                         and not alive and not health.uplink_down):
                     log("ни один сервер не отвечает — принудительное переподключение",
                         level="error")
+                    t0 = time.monotonic()
                     recovery.perform("ни один сервер подписки не отвечает")
+                    treated += time.monotonic() - t0
 
             if cfg["killswitch"]["enabled"]:
                 # Сервер мог смениться — правила пересобираются под новый адрес,
@@ -2699,10 +2742,12 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
                 state.pop("subs_notice", None)
 
         elapsed = time.monotonic() - started
-        if elapsed > interval * 1.5:
+        # Лечение (verify + пауза backoff) длится минуты по замыслу — это не
+        # медленные пробы, и предупреждать о нём незачем.
+        if elapsed - treated > interval * 1.5:
             # Раньше это было нормой: последовательные пробы складывали таймауты,
             # и между проверками проходили минуты вместо `interval`.
-            log(f"цикл проверок занял {elapsed:.0f} с при интервале {interval:.0f} с",
+            log(f"цикл проверок занял {elapsed - treated:.0f} с при интервале {interval:.0f} с",
                 level="warn")
         stop.wait(max(1.0, interval - elapsed))
 

@@ -413,6 +413,28 @@ class SubscriptionStatus(unittest.TestCase):
     def test_no_data_yet(self):
         self.assertTrue(w.check_subscription(self.cfg).ok)
 
+    def test_abandoned_expired_subscription_next_to_live_one_is_ignored(self):
+        # Старый провайдер остался в логе Happ, а пользуются уже другим.
+        now = int(time.time())
+        w.SUBS_CACHE_PATH.write_text(json.dumps({
+            "https://old.example/sub": {"ts": now, "servers": [], "title": "ALL VPN",
+                                        "userinfo": f"download=0; total=10; expire={now - 56 * 86400}"},
+            "https://new.example/sub": {"ts": now, "servers": [], "title": "MIG VPN",
+                                        "userinfo": f"download=1; total=1000; expire={now + 13 * 86400}"},
+        }))
+        self.assertEqual(w.subscription_problems(self.cfg), [])
+        check = w.check_subscription(self.cfg)
+        self.assertTrue(check.ok)
+        self.assertNotIn("ALL VPN", check.detail)
+
+    def test_same_subscription_under_two_urls_is_listed_once(self):
+        now = int(time.time())
+        entry = {"ts": now, "servers": [], "title": "MIG VPN",
+                 "userinfo": f"download=1; total=1000; expire={now + 13 * 86400}"}
+        w.SUBS_CACHE_PATH.write_text(json.dumps({"https://a.example/1": entry,
+                                                 "https://a.example/2": entry}))
+        self.assertEqual(len(w.subscription_status(self.cfg)), 1)
+
     def test_human_bytes(self):
         self.assertEqual(w.human_bytes(536870912000), "500 ГБ")
         self.assertEqual(w.human_bytes(0), "0 Б")

@@ -77,6 +77,8 @@ DEFAULTS: dict = {
         "binary": "/opt/happ/bin/Happ",
         "socks_host": "127.0.0.1",
         "socks_port": 10808,
+        "http_port": 10809,
+        "mode": "auto",
         "tun_interface": "tun0",
         "require_tun": True,
         "require_singbox": True,
@@ -124,6 +126,7 @@ DEFAULTS: dict = {
         "core_log_level": "info",
         "kill_orphan_cores": True,
         "orphan_grace": 60,
+        "fix_system_proxy": True,
     },
     "killswitch": {
         "enabled": False,
@@ -203,6 +206,12 @@ webhook_timeout = 10
 binary = "/opt/happ/bin/Happ"
 socks_host = "127.0.0.1"
 socks_port = 10808
+http_port = 10809             # HTTP-вход Happ — его выставляет системный прокси
+# Режим Happ: "tun" (весь трафик через tun0), "proxy" (TUN выключен, система
+# ходит через системный прокси) или "auto" — взять из ~/.config/Happ.conf
+# (AdvancedSettings\tun). В режиме прокси tun0 и sing-box не требуются, а
+# вместо проверки утечки проверяется, что системный прокси ведёт в Happ.
+mode = "auto"
 tun_interface = "tun0"
 require_tun = true            # исчезнувший tun0 считается падением
 require_singbox = true
@@ -277,6 +286,10 @@ fix_core_log_level = true     # без уровня логов Happ не пиш�
 core_log_level = "info"
 kill_orphan_cores = true      # xray, переживший свой GUI, держит SOCKS-порт
 orphan_grace = 60             # сколько ждать, прежде чем счесть ядро осиротевшим
+# Только в режиме прокси: Happ с включённым Per-App Proxy снимает системный
+# прокси при подключении, и браузер (а с ним Claude) идёт напрямую — 403.
+# Сторож возвращает прокси GNOME на HTTP-вход Happ (gsettings).
+fix_system_proxy = true
 
 [killswitch]
 # Пока выключен. Включённый kill-switch не выпускает трафик наружу мимо туннеля:
@@ -512,6 +525,32 @@ def socks5_connect(proxy_host: str, proxy_port: int, dst_host: str, dst_port: in
         raise
 
 
+def http_connect(proxy_host: str, proxy_port: int, dst_host: str, dst_port: int,
+                 timeout: float) -> socket.socket:
+    """TCP через HTTP-прокси (CONNECT) — так ходит браузер при системном прокси."""
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        target = f"[{dst_host}]:{dst_port}" if ":" in dst_host else f"{dst_host}:{dst_port}"
+        sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(1)
+            if not chunk:
+                raise OSError("HTTP-прокси закрыл соединение")
+            head += chunk
+            if len(head) > 8192:
+                raise OSError("HTTP-прокси: слишком длинный ответ")
+        status = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        parts = status.split()
+        if len(parts) < 2 or parts[1] != "200":
+            raise OSError(f"HTTP-прокси отказал: {status[:60]}")
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = b""
     while len(buf) < n:
@@ -523,7 +562,8 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def _https_get(host: str, path: str, timeout: float, via_socks: tuple[str, int] | None,
-               port: int = 443, *, read_all: bool = False) -> tuple[str, float]:
+               port: int = 443, *, read_all: bool = False,
+               via_http: tuple[str, int] | None = None) -> tuple[str, float]:
     """TLS + GET. Возвращает (ответ, миллисекунды); при любой сетевой беде бросает.
 
     read_all=False читает один recv — этого хватает на строку статуса и стоит
@@ -538,6 +578,8 @@ def _https_get(host: str, path: str, timeout: float, via_socks: tuple[str, int] 
     try:
         if via_socks:
             sock = socks5_connect(via_socks[0], via_socks[1], target, port, timeout)
+        elif via_http:
+            sock = http_connect(via_http[0], via_http[1], target, port, timeout)
         else:
             sock = socket.create_connection((target, port), timeout=timeout)
         sock.settimeout(timeout)
@@ -564,7 +606,8 @@ def _https_get(host: str, path: str, timeout: float, via_socks: tuple[str, int] 
 
 
 def http_probe(host: str, path: str, timeout: float, *, via_socks: tuple[str, int] | None,
-               port: int = 443, expect_code: int | None = None) -> tuple[bool, str, float]:
+               port: int = 443, expect_code: int | None = None,
+               via_http: tuple[str, int] | None = None) -> tuple[bool, str, float]:
     """TLS + HTTP GET. Возвращает (успех, описание, миллисекунды).
 
     expect_code задаёт точный ожидаемый ответ: для некоторых адресов «неудобный»
@@ -573,7 +616,7 @@ def http_probe(host: str, path: str, timeout: float, *, via_socks: tuple[str, in
     """
     t0 = time.monotonic()
     try:
-        head, ms = _https_get(host, path, timeout, via_socks, port)
+        head, ms = _https_get(host, path, timeout, via_socks, port, via_http=via_http)
         status = head.split("\r\n", 1)[0]
         code = 0
         parts = status.split()
@@ -1027,16 +1070,17 @@ def check_processes(cfg: dict) -> Check:
     tun_name = cfg["happ"]["tun_interface"]
     tun_ip = iface_addr(tun_name) if iface_exists(tun_name) else None
 
+    tun_mode = happ_mode(cfg) == "tun"
     problems = []
     if not xray:
         problems.append("ядро xray не запущено")
-    if cfg["happ"]["require_singbox"] and not singbox:
+    if tun_mode and cfg["happ"]["require_singbox"] and not singbox:
         problems.append("sing-box (tun) не запущен")
-    if cfg["happ"]["require_tun"] and not tun_ip:
+    if tun_mode and cfg["happ"]["require_tun"] and not tun_ip:
         problems.append(f"интерфейс {tun_name} отсутствует")
 
     detail = (f"xray={xray[0] if xray else '-'} sing-box={singbox[0] if singbox else '-'} "
-              f"{tun_name}={tun_ip or '-'}")
+              f"{tun_name}={tun_ip or '-'}" + ("" if tun_mode else " (режим прокси, TUN не нужен)"))
     if problems:
         detail = ", ".join(problems)
         if xray and not singbox and not tun_ip:
@@ -1138,14 +1182,15 @@ def check_system_dns(cfg: dict) -> Check:
                  "; ".join(errors[:2]) + " — похоже, DNS идёт мимо туннеля")
 
 
-def exit_trace(cfg: dict, *, via_socks: bool) -> tuple[dict[str, str], str]:
+def exit_trace(cfg: dict, *, via_socks: bool,
+               via_http: tuple[str, int] | None = None) -> tuple[dict[str, str], str]:
     """Ответ /cdn-cgi/trace целиком: ip, loc (страна выхода), colo и прочее."""
     host = cfg["checks"]["leak_host"]
     path = cfg["checks"]["leak_path"]
     timeout = float(cfg["checks"]["tcp_timeout"])
     proxy = (cfg["happ"]["socks_host"], int(cfg["happ"]["socks_port"])) if via_socks else None
     try:
-        body, _ = _https_get(host, path, timeout, proxy, read_all=True)
+        body, _ = _https_get(host, path, timeout, proxy, read_all=True, via_http=via_http)
     except Exception as exc:  # noqa: BLE001
         return {}, f"{type(exc).__name__}: {exc}"
     trace = {}
@@ -1290,8 +1335,10 @@ def check_expected(cfg: dict) -> list[Check]:
     """Адреса, у которых здоровьем считается конкретный код ответа."""
     items = list(cfg["checks"]["expect"])
     timeout = float(cfg["checks"]["tcp_timeout"])
+    route = system_route(cfg)
     results = _parallel([partial(http_probe, item["host"], item.get("path", "/"), timeout,
-                                 via_socks=None, expect_code=int(item["code"]))
+                                 via_socks=None, via_http=route,
+                                 expect_code=int(item["code"]))
                          for item in items])
     return [Check(f"{item['host']} → ждём {int(item['code'])}", ok, detail, ms,
                   critical=bool(item.get("critical", True)))
@@ -1302,12 +1349,12 @@ def check_expected(cfg: dict) -> list[Check]:
 # Claude: откуда 403 и что с ним делать
 # --------------------------------------------------------------------------
 
-def http_status(host: str, path: str, timeout: float,
-                via_socks: tuple[str, int] | None) -> tuple[int | None, str, float]:
+def http_status(host: str, path: str, timeout: float, via_socks: tuple[str, int] | None,
+                via_http: tuple[str, int] | None = None) -> tuple[int | None, str, float]:
     """(код ответа или None, ошибка, мс) — отличает «ответили 403» от «не достучались»."""
     t0 = time.monotonic()
     try:
-        head, ms = _https_get(host, path, timeout, via_socks)
+        head, ms = _https_get(host, path, timeout, via_socks, via_http=via_http)
     except Exception as exc:  # noqa: BLE001
         return None, f"{type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000
     parts = head.split("\r\n", 1)[0].split()
@@ -1337,10 +1384,12 @@ def diagnose_claude(cfg: dict) -> ClaudeDiagnosis:
     want = int(cfg["claude"]["code"])
     timeout = float(cfg["checks"]["tcp_timeout"])
     proxy = (cfg["happ"]["socks_host"], int(cfg["happ"]["socks_port"]))
+    mode = happ_mode(cfg)
+    route = system_route(cfg)            # путь браузера: системный прокси или напрямую
     (d_code, d_err, d_ms), (s_code, s_err, s_ms), (d_tr, d_terr), (s_tr, s_terr) = _parallel([
-        partial(http_status, host, path, timeout, None),
+        partial(http_status, host, path, timeout, None, via_http=route),
         partial(http_status, host, path, timeout, proxy),
-        partial(exit_trace, cfg, via_socks=False),
+        partial(exit_trace, cfg, via_socks=False, via_http=route),
         partial(exit_trace, cfg, via_socks=True),
     ])
     tun = cfg["happ"]["tun_interface"]
@@ -1351,8 +1400,11 @@ def diagnose_claude(cfg: dict) -> ClaudeDiagnosis:
             return f"выход не определён ({err})"
         return f"выход {trace.get('ip', '?')}, страна {trace.get('loc', '?')}"
 
+    path_name = (f"через системный прокси {route[0]}:{route[1]}" if route
+                 else "напрямую" + (" (TUN)" if mode == "tun" else ", системного прокси нет"))
     lines = [
-        f"напрямую (как браузер и claude): {d_code or d_err} за {d_ms:.0f} ms; {where(d_tr, d_terr)}",
+        f"режим Happ: {'TUN' if mode == 'tun' else 'прокси (TUN выключен)'}",
+        f"как браузер — {path_name}: {d_code or d_err} за {d_ms:.0f} ms; {where(d_tr, d_terr)}",
         f"через SOCKS {proxy[0]}:{proxy[1]}: {s_code or s_err} за {s_ms:.0f} ms; {where(s_tr, s_terr)}",
         f"{tun}: {tun_ip or 'нет'}; sing-box: "
         f"{'pid ' + str(pids_matching(SINGBOX_PATH_HINT)[0]) if pids_matching(SINGBOX_PATH_HINT) else 'не запущен'}",
@@ -1361,8 +1413,13 @@ def diagnose_claude(cfg: dict) -> ClaudeDiagnosis:
     if d_code == want:
         return ClaudeDiagnosis("ok", f"{host} отвечает штатно ({want}), страна выхода {d_loc}", lines)
     if s_code == want:
-        why = (f"нет {tun} — Happ подключён без TUN" if not tun_ip
-               else f"{tun} есть, но маршрут системы идёт мимо него")
+        if mode == "proxy":
+            why = ("системный прокси не ведёт в Happ" if not route
+                   else f"системный прокси {route[0]}:{route[1]} выходит не через VPN")
+        elif not tun_ip:
+            why = f"нет {tun} — Happ подключён без TUN"
+        else:
+            why = f"{tun} есть, но маршрут системы идёт мимо него"
         return ClaudeDiagnosis(
             "bypass", f"система ходит в Claude мимо VPN (страна {d_loc}, ответ {d_code or d_err}), "
                       f"а через туннель всё работает (страна {s_loc}): {why}", lines)
@@ -1396,6 +1453,9 @@ def fix_claude(cfg: dict, happ: Happ, state: dict, *, echo: bool = False) -> Cla
 
     if diag.verdict == "region":
         steps = [("переподключение — Happ может выбрать другой сервер", "cycle")]
+    elif diag.verdict == "bypass" and happ_mode(cfg) == "proxy":
+        steps = [("направить системный прокси в Happ", "sysproxy"),
+                 ("переподключение VPN", "cycle")]
     elif diag.verdict == "bypass":
         steps = [("переподключение, чтобы поднялся TUN", "cycle")]
         if cfg["recovery"]["allow_gui_restart"]:
@@ -1407,10 +1467,17 @@ def fix_claude(cfg: dict, happ: Happ, state: dict, *, echo: bool = False) -> Cla
 
     for title, kind in steps:
         say(f"пробую: {title}", "warn")
-        if kind == "cycle":
+        if kind == "sysproxy":
+            if not apply_system_proxy(cfg):
+                say("gsettings не сработал — системный прокси не выставлен", "warn")
+                continue
+        elif kind == "cycle":
             happ.disconnect()
             happ.stop.wait(3)
             happ.connect()
+            if happ_mode(cfg) == "proxy" and cfg["selfheal"]["fix_system_proxy"]:
+                happ.stop.wait(3)       # Happ при подключении мог снова снять прокси
+                apply_system_proxy(cfg)
         elif kind == "gui":
             happ.disconnect()
             happ.stop.wait(2)
@@ -1436,8 +1503,12 @@ def fix_claude(cfg: dict, happ: Happ, state: dict, *, echo: bool = False) -> Cla
         diag = after
         say(f"после «{title}» не помогло: {diag.explanation}", "warn")
 
+    proxy_hint = ("в Happ выключите Per-App Proxy (он снимает системный прокси) или "
+                  "задайте прокси вручную: Настройки → Сеть → Прокси → 127.0.0.1:"
+                  f"{cfg['happ']['http_port']}")
     hint = {
-        "bypass": "включите в Happ режим TUN (системный VPN) и переподключитесь; "
+        "bypass": proxy_hint if happ_mode(cfg) == "proxy" else
+                  "включите в Happ режим TUN (системный VPN) и переподключитесь; "
                   "если sing-box не стартует — sudo systemctl restart "
                   f"{cfg['recovery']['daemon_service']}",
         "region": "выберите в Happ сервер в другой стране (не RU/CN/IR/BY и т.п.)",
@@ -1522,14 +1593,21 @@ def run_health(cfg: dict, *, include_logs: bool = True) -> Health:
             return health                # физической сети нет — VPN дёргать бессмысленно
     # Проверки независимы друг от друга, поэтому идут одновременно: цикл должен
     # укладываться в `interval`, даже когда всё вокруг отвечает таймаутами.
+    tun_mode = happ_mode(cfg) == "tun"
     tasks = [("Процессы и туннель", partial(check_processes, cfg)),
              ("SOCKS", partial(check_proxy, cfg, via_socks=True))]
-    if cfg["checks"]["check_direct_path"]:
+    if tun_mode and cfg["checks"]["check_direct_path"]:
         tasks.append(("Системный путь (через tun)", partial(check_proxy, cfg, via_socks=False)))
     tasks += [("DNS", partial(check_dns, cfg)),
-              ("Системный DNS (браузер)", partial(check_system_dns, cfg)),
-              ("Утечка мимо туннеля", partial(check_leak, cfg)),
-              ("Подписка", partial(check_subscription, cfg)),
+              ("Системный DNS (браузер)", partial(check_system_dns, cfg))]
+    # Без TUN система по замыслу ходит напрямую, а в VPN — только через прокси:
+    # сравнение выходов было бы вечной ложной «утечкой». Вместо него — проверка,
+    # что системный прокси вообще ведёт в Happ.
+    if tun_mode:
+        tasks.append(("Утечка мимо туннеля", partial(check_leak, cfg)))
+    else:
+        tasks.append(("Системный прокси", partial(check_system_proxy, cfg)))
+    tasks += [("Подписка", partial(check_subscription, cfg)),
               ("Ожидаемые коды ответа", partial(check_expected, cfg))]
     if include_logs and cfg["checks"]["scan_logs"]:
         tasks.append(("Логи ядра Happ", partial(check_happ_logs, cfg)))
@@ -2081,6 +2159,103 @@ def read_happ_settings() -> dict[str, str]:
     return values
 
 
+def happ_mode(cfg: dict) -> str:
+    """"tun" или "proxy": из конфига сторожа или (auto) из настроек Happ."""
+    mode = str(cfg["happ"].get("mode", "auto")).lower()
+    if mode in ("tun", "proxy"):
+        return mode
+    return "proxy" if read_happ_settings().get("AdvancedSettings\\tun") == "false" else "tun"
+
+
+def _gsettings(*args: str) -> str | None:
+    if not shutil.which("gsettings"):
+        return None
+    try:
+        proc = subprocess.run(["gsettings", *args], capture_output=True, text=True,
+                              timeout=5, check=False, env=session_env())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip().strip("'") if proc.returncode == 0 else None
+
+
+def system_proxy_state() -> dict | None:
+    """Системный прокси GNOME — его читают браузеры и Electron-приложения (Claude)."""
+    mode = _gsettings("get", "org.gnome.system.proxy", "mode")
+    if mode is None:
+        return None
+    state: dict = {"mode": mode}
+    for kind in ("https", "http", "socks"):
+        host = _gsettings("get", f"org.gnome.system.proxy.{kind}", "host") or ""
+        port = _gsettings("get", f"org.gnome.system.proxy.{kind}", "port") or "0"
+        state[kind] = (host, int(port) if port.isdigit() else 0)
+    return state
+
+
+def system_route(cfg: dict) -> tuple[str, int] | None:
+    """Через какой HTTP-прокси сейчас ходит браузер (None — напрямую).
+
+    В режиме TUN браузер ходит «напрямую» в tun0 — прокси не при чём.
+    """
+    if happ_mode(cfg) == "tun":
+        return None
+    state = system_proxy_state()
+    if not state or state["mode"] != "manual":
+        return None
+    for kind in ("https", "http"):
+        host, port = state[kind]
+        if host and port:
+            return host, port
+    return None
+
+
+def check_system_proxy(cfg: dict) -> Check:
+    name = "Системный прокси"
+    state = system_proxy_state()
+    if state is None:
+        return Check(name, True, "gsettings недоступен — проверить нельзя", critical=False)
+    ports = {int(cfg["happ"]["http_port"]), int(cfg["happ"]["socks_port"])}
+    local = ("127.0.0.1", "localhost", "::1")
+    if state["mode"] == "manual":
+        for kind in ("https", "http", "socks"):
+            host, port = state[kind]
+            if host in local and port in ports:
+                return Check(name, True, f"{kind}://{host}:{port} — браузер идёт через Happ",
+                             critical=False)
+        return Check(name, False, "прокси задан, но не на Happ: " + ", ".join(
+            f"{k}={h}:{p}" for k in ("https", "http", "socks") for h, p in [state[k]] if h),
+            critical=False)
+    return Check(name, False, f"выключен (mode={state['mode']}) — браузер и Claude "
+                              "ходят напрямую мимо VPN", critical=False)
+
+
+def apply_system_proxy(cfg: dict) -> bool:
+    """Направить системный прокси GNOME в Happ: HTTP(S) на http_port, SOCKS на socks_port."""
+    host = cfg["happ"]["socks_host"]
+    http_port = str(int(cfg["happ"]["http_port"]))
+    socks_port = str(int(cfg["happ"]["socks_port"]))
+    steps = [("org.gnome.system.proxy.http", "host", host),
+             ("org.gnome.system.proxy.http", "port", http_port),
+             ("org.gnome.system.proxy.https", "host", host),
+             ("org.gnome.system.proxy.https", "port", http_port),
+             ("org.gnome.system.proxy.socks", "host", host),
+             ("org.gnome.system.proxy.socks", "port", socks_port),
+             ("org.gnome.system.proxy", "mode", "manual")]
+    return all(_gsettings("set", schema, key, value) is not None
+               for schema, key, value in steps)
+
+
+def selfheal_system_proxy(cfg: dict) -> list[str]:
+    if (not cfg["selfheal"]["fix_system_proxy"] or happ_mode(cfg) != "proxy"
+            or not pids_matching(XRAY_PATH_HINT)):
+        return []                        # VPN выключен — прокси в никуда хуже прямого пути
+    if check_system_proxy(cfg).ok:
+        return []
+    if apply_system_proxy(cfg):
+        return [f"системный прокси направлен в Happ (127.0.0.1:{cfg['happ']['http_port']})"]
+    log("не удалось выставить системный прокси через gsettings", level="warn")
+    return []
+
+
 def desired_happ_settings(cfg: dict) -> dict[str, str]:
     """Настройки Happ, которые сторож считает единственно верными.
 
@@ -2212,7 +2387,8 @@ def selfheal_orphan_cores(cfg: dict, happ: Happ, state: dict) -> list[str]:
 def selfheal(cfg: dict, happ: Happ, state: dict) -> list[str]:
     if not cfg["selfheal"]["enabled"]:
         return []
-    return selfheal_settings(cfg, happ, state) + selfheal_orphan_cores(cfg, happ, state)
+    return (selfheal_settings(cfg, happ, state) + selfheal_orphan_cores(cfg, happ, state)
+            + selfheal_system_proxy(cfg))
 
 
 def load_state() -> dict:
@@ -2638,6 +2814,11 @@ def cmd_doctor(cfg: dict, args: argparse.Namespace) -> int:
     print(f"    {tun}: {iface_addr(tun) or 'нет'}")
     print(f"    IPv6 наружу: {ipv6_leaks_outside_tunnel(cfg) or 'мимо туннеля не идёт'}")
     print(f"    резолверы системы: {', '.join(system_resolvers()) or 'нет'}")
+    print(f"    режим Happ: {happ_mode(cfg)}")
+    sp = system_proxy_state()
+    print("    системный прокси: " + ("gsettings недоступен" if sp is None else
+          f"{sp['mode']}; " + ", ".join(f"{k}={h}:{p}" for k in ("https", "http", "socks")
+                                       for h, p in [sp[k]] if h)))
 
     section("Проверки")
     health = run_health(cfg)

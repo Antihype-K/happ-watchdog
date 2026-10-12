@@ -831,6 +831,7 @@ class ClaudeForbidden(unittest.TestCase):
         self.cfg = default_cfg()
         self.cfg["general"]["verify_timeout"] = 0.2
         self.cfg["general"]["notify"] = False
+        self.cfg["happ"] = dict(self.cfg["happ"], mode="tun")
         self.saved = (w.http_status, w.exit_trace, w.iface_exists, w.iface_addr,
                       w.pids_matching)
         w.iface_exists = lambda name: False
@@ -842,9 +843,9 @@ class ClaudeForbidden(unittest.TestCase):
          w.pids_matching) = self.saved
 
     def fake(self, direct, socks, direct_loc="RU", socks_loc="NL"):
-        w.http_status = lambda host, path, timeout, via: (
+        w.http_status = lambda host, path, timeout, via, **kw: (
             (socks, "", 1.0) if via else (direct, "", 1.0))
-        w.exit_trace = lambda cfg, via_socks: (
+        w.exit_trace = lambda cfg, via_socks, **kw: (
             {"ip": "1.1.1.1", "loc": socks_loc if via_socks else direct_loc}, "")
 
     def test_healthy(self):
@@ -901,3 +902,75 @@ class ClaudeForbidden(unittest.TestCase):
                                           critical=False)])
         self.assertTrue(w.claude_failed(self.cfg, health))
         self.assertFalse(w.claude_failed(self.cfg, w.Health()))
+
+
+class ProxyMode(unittest.TestCase):
+    """TUN выключен: tun0 не нужен, вместо утечки — системный прокси."""
+
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.cfg["happ"] = dict(self.cfg["happ"], mode="proxy")
+        self.saved = (w.pids_matching, w.iface_exists, w.iface_addr, w._gsettings)
+        w.pids_matching = lambda needle: [42] if needle == w.XRAY_PATH_HINT else []
+        w.iface_exists = lambda name: False
+        w.iface_addr = lambda name: None
+        self.gs = {"org.gnome.system.proxy mode": "none"}
+        def fake_gsettings(*args):
+            if args[0] == "set":
+                self.gs[f"{args[1]} {args[2]}"] = args[3]
+                return ""
+            return self.gs.get(f"{args[1]} {args[2]}", "")
+        w._gsettings = fake_gsettings
+
+    def tearDown(self):
+        w.pids_matching, w.iface_exists, w.iface_addr, w._gsettings = self.saved
+
+    def test_auto_mode_reads_happ_conf(self):
+        saved = w.HAPP_SETTINGS_PATH
+        try:
+            w.HAPP_SETTINGS_PATH = Path(tempfile.mkdtemp()) / "Happ.conf"
+            w.HAPP_SETTINGS_PATH.write_text("[Preferences]\nAdvancedSettings\\tun=false\n")
+            cfg = default_cfg()
+            self.assertEqual(w.happ_mode(cfg), "proxy")
+            w.HAPP_SETTINGS_PATH.write_text("[Preferences]\nAdvancedSettings\\tun=true\n")
+            self.assertEqual(w.happ_mode(cfg), "tun")
+        finally:
+            w.HAPP_SETTINGS_PATH = saved
+
+    def test_missing_tun_is_fine_without_tun(self):
+        self.assertTrue(w.check_processes(self.cfg).ok)
+
+    def test_cleared_system_proxy_is_reported_and_repaired(self):
+        self.assertFalse(w.check_system_proxy(self.cfg).ok)
+        self.assertIsNone(w.system_route(self.cfg))
+        fixed = w.selfheal_system_proxy(self.cfg)
+        self.assertTrue(fixed)
+        self.assertTrue(w.check_system_proxy(self.cfg).ok)
+        self.assertEqual(w.system_route(self.cfg), ("127.0.0.1", 10809))
+
+    def test_no_repair_when_vpn_is_off(self):
+        w.pids_matching = lambda needle: []
+        self.assertEqual(w.selfheal_system_proxy(self.cfg), [])
+        self.assertEqual(self.gs["org.gnome.system.proxy mode"], "none")
+
+
+class HttpConnect(unittest.TestCase):
+    def test_tunnel_through_http_proxy(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        seen = []
+
+        def serve():
+            conn, _ = server.accept()
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(100)
+            seen.append(data.decode())
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            conn.close()
+        threading.Thread(target=serve, daemon=True).start()
+        sock = w.http_connect("127.0.0.1", server.getsockname()[1], "api.anthropic.com", 443, 2)
+        sock.close()
+        server.close()
+        self.assertTrue(seen[0].startswith("CONNECT api.anthropic.com:443 "))

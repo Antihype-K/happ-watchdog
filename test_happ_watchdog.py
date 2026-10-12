@@ -822,3 +822,82 @@ class HealthSemantics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ClaudeForbidden(unittest.TestCase):
+    """403 от Claude: сторож различает «мимо туннеля» и «страна выхода закрыта»."""
+
+    def setUp(self):
+        self.cfg = default_cfg()
+        self.cfg["general"]["verify_timeout"] = 0.2
+        self.cfg["general"]["notify"] = False
+        self.saved = (w.http_status, w.exit_trace, w.iface_exists, w.iface_addr,
+                      w.pids_matching)
+        w.iface_exists = lambda name: False
+        w.iface_addr = lambda name: None
+        w.pids_matching = lambda needle: []
+
+    def tearDown(self):
+        (w.http_status, w.exit_trace, w.iface_exists, w.iface_addr,
+         w.pids_matching) = self.saved
+
+    def fake(self, direct, socks, direct_loc="RU", socks_loc="NL"):
+        w.http_status = lambda host, path, timeout, via: (
+            (socks, "", 1.0) if via else (direct, "", 1.0))
+        w.exit_trace = lambda cfg, via_socks: (
+            {"ip": "1.1.1.1", "loc": socks_loc if via_socks else direct_loc}, "")
+
+    def test_healthy(self):
+        self.fake(404, 404)
+        self.assertEqual(w.diagnose_claude(self.cfg).verdict, "ok")
+
+    def test_bypass_without_tun(self):
+        self.fake(403, 404)
+        diag = w.diagnose_claude(self.cfg)
+        self.assertEqual(diag.verdict, "bypass")
+        self.assertIn("без TUN", diag.explanation)
+        self.assertIn("RU", diag.explanation)
+
+    def test_blocked_exit_country(self):
+        self.fake(403, 403, socks_loc="RU")
+        diag = w.diagnose_claude(self.cfg)
+        self.assertEqual(diag.verdict, "region")
+        self.assertIn("RU", diag.explanation)
+
+    def test_fix_reconnects_and_reports_success(self):
+        self.fake(403, 404)
+        calls = []
+
+        class FakeHapp:
+            stop = threading.Event()
+            def disconnect(self):
+                calls.append("disconnect")
+            def connect(self):
+                calls.append("connect")
+                ClaudeForbidden.fake(self_test, 404, 404)
+        self_test = self
+        state = {}
+        diag = w.fix_claude(self.cfg, FakeHapp(), state)
+        self.assertEqual(diag.verdict, "ok")
+        self.assertEqual(calls, ["disconnect", "connect"])
+        self.assertIn("claude_fix_at", state)
+
+    def test_fix_gives_up_with_hint_and_does_not_loop(self):
+        self.fake(403, 403)
+        calls = []
+
+        class FakeHapp:
+            stop = threading.Event()
+            def disconnect(self):
+                calls.append("disconnect")
+            def connect(self):
+                calls.append("connect")
+        diag = w.fix_claude(self.cfg, FakeHapp(), {})
+        self.assertEqual(diag.verdict, "region")
+        self.assertEqual(calls, ["disconnect", "connect"])   # одна попытка, не круг
+
+    def test_failed_probe_is_found_by_host(self):
+        health = w.Health(checks=[w.Check("api.anthropic.com → ждём 404", False, "403",
+                                          critical=False)])
+        self.assertTrue(w.claude_failed(self.cfg, health))
+        self.assertFalse(w.claude_failed(self.cfg, w.Health()))

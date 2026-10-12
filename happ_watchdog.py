@@ -64,6 +64,7 @@ DEFAULTS: dict = {
         "startup_grace": 45,
         "notify": True,
         "quiet_when_healthy": True,
+        "verbose": False,
         "only_when_gui_running": True,
     },
     "notify": {
@@ -107,6 +108,13 @@ DEFAULTS: dict = {
         ],
         "log_error_threshold": 40,
         "log_window": 120,
+    },
+    "claude": {
+        "autofix": True,
+        "host": "api.anthropic.com",
+        "path": "/",
+        "code": 404,
+        "cooldown": 900,
     },
     "selfheal": {
         "enabled": True,
@@ -175,6 +183,8 @@ verify_timeout = 45           # сколько ждать восстановле
 startup_grace = 45            # после запуска Happ дать туннелю подняться, не вмешиваясь
 notify = true                 # уведомления через notify-send
 quiet_when_healthy = true     # не писать в лог каждую успешную проверку
+verbose = false               # писать в журнал каждую проверку каждого цикла с деталями
+                              # (то же, что `run -v`); смотреть: happ-watchdog logs -f
 only_when_gui_running = true  # если Happ закрыт — считать, что VPN выключен намеренно
 
 [notify]
@@ -243,6 +253,19 @@ host = "api.anthropic.com"
 path = "/"
 code = 404
 critical = false
+
+[claude]
+# Claude (api.anthropic.com) отвечает 403, когда запрос пришёл из региона, где
+# сервис не работает. Сторож сам выясняет, откуда пришёл 403, и лечит то, что
+# лечится: трафик мимо туннеля — переподключением VPN, пока не поднимется TUN;
+# выход VPN в закрытой стране — одной попыткой переподключения (Happ может
+# выбрать другой сервер), дальше только уведомление: страну выхода сторож
+# поменять не в силах. Разбор руками: happ-watchdog fix-claude
+autofix = true
+host = "api.anthropic.com"
+path = "/"
+code = 404                    # штатный ответ на GET /
+cooldown = 900                # не чаще, чем раз в столько секунд
 
 [selfheal]
 # Починка причин, а не симптомов. Настройки Happ правятся только при закрытом
@@ -1115,6 +1138,24 @@ def check_system_dns(cfg: dict) -> Check:
                  "; ".join(errors[:2]) + " — похоже, DNS идёт мимо туннеля")
 
 
+def exit_trace(cfg: dict, *, via_socks: bool) -> tuple[dict[str, str], str]:
+    """Ответ /cdn-cgi/trace целиком: ip, loc (страна выхода), colo и прочее."""
+    host = cfg["checks"]["leak_host"]
+    path = cfg["checks"]["leak_path"]
+    timeout = float(cfg["checks"]["tcp_timeout"])
+    proxy = (cfg["happ"]["socks_host"], int(cfg["happ"]["socks_port"])) if via_socks else None
+    try:
+        body, _ = _https_get(host, path, timeout, proxy, read_all=True)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"{type(exc).__name__}: {exc}"
+    trace = {}
+    for line in body.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.isalnum():
+            trace[key] = value.strip()
+    return trace, ("" if "ip" in trace else "в ответе нет строки ip=")
+
+
 def exit_ip(cfg: dict, *, via_socks: bool) -> tuple[str | None, str]:
     """Внешний IP, каким его видит сервер, — по SOCKS или по системному маршруту.
 
@@ -1255,6 +1296,156 @@ def check_expected(cfg: dict) -> list[Check]:
     return [Check(f"{item['host']} → ждём {int(item['code'])}", ok, detail, ms,
                   critical=bool(item.get("critical", True)))
             for item, (ok, detail, ms) in zip(items, results)]
+
+
+# --------------------------------------------------------------------------
+# Claude: откуда 403 и что с ним делать
+# --------------------------------------------------------------------------
+
+def http_status(host: str, path: str, timeout: float,
+                via_socks: tuple[str, int] | None) -> tuple[int | None, str, float]:
+    """(код ответа или None, ошибка, мс) — отличает «ответили 403» от «не достучались»."""
+    t0 = time.monotonic()
+    try:
+        head, ms = _https_get(host, path, timeout, via_socks)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000
+    parts = head.split("\r\n", 1)[0].split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1]), "", ms
+    return None, f"непонятный ответ: {head[:60]!r}", ms
+
+
+@dataclass
+class ClaudeDiagnosis:
+    verdict: str                 # ok | bypass | region | socks_down | unknown
+    explanation: str
+    lines: list[str] = field(default_factory=list)
+
+
+def diagnose_claude(cfg: dict) -> ClaudeDiagnosis:
+    """Сравнить ответ Claude напрямую и через туннель, плюс страну выхода по обоим путям.
+
+    403 от api.anthropic.com — это отказ по региону, а не поломка сервиса.
+    Важно, *какой* путь его получил: если через SOCKS приходит штатный 404, то
+    туннель здоров, а система просто ходит мимо него (нет TUN). Если 403 и через
+    SOCKS — страна выхода VPN-сервера закрыта для Claude, и лечится это только
+    сменой сервера.
+    """
+    host = cfg["claude"]["host"]
+    path = cfg["claude"]["path"]
+    want = int(cfg["claude"]["code"])
+    timeout = float(cfg["checks"]["tcp_timeout"])
+    proxy = (cfg["happ"]["socks_host"], int(cfg["happ"]["socks_port"]))
+    (d_code, d_err, d_ms), (s_code, s_err, s_ms), (d_tr, d_terr), (s_tr, s_terr) = _parallel([
+        partial(http_status, host, path, timeout, None),
+        partial(http_status, host, path, timeout, proxy),
+        partial(exit_trace, cfg, via_socks=False),
+        partial(exit_trace, cfg, via_socks=True),
+    ])
+    tun = cfg["happ"]["tun_interface"]
+    tun_ip = iface_addr(tun) if iface_exists(tun) else None
+
+    def where(trace: dict[str, str], err: str) -> str:
+        if not trace:
+            return f"выход не определён ({err})"
+        return f"выход {trace.get('ip', '?')}, страна {trace.get('loc', '?')}"
+
+    lines = [
+        f"напрямую (как браузер и claude): {d_code or d_err} за {d_ms:.0f} ms; {where(d_tr, d_terr)}",
+        f"через SOCKS {proxy[0]}:{proxy[1]}: {s_code or s_err} за {s_ms:.0f} ms; {where(s_tr, s_terr)}",
+        f"{tun}: {tun_ip or 'нет'}; sing-box: "
+        f"{'pid ' + str(pids_matching(SINGBOX_PATH_HINT)[0]) if pids_matching(SINGBOX_PATH_HINT) else 'не запущен'}",
+    ]
+    d_loc, s_loc = d_tr.get("loc", "?"), s_tr.get("loc", "?")
+    if d_code == want:
+        return ClaudeDiagnosis("ok", f"{host} отвечает штатно ({want}), страна выхода {d_loc}", lines)
+    if s_code == want:
+        why = (f"нет {tun} — Happ подключён без TUN" if not tun_ip
+               else f"{tun} есть, но маршрут системы идёт мимо него")
+        return ClaudeDiagnosis(
+            "bypass", f"система ходит в Claude мимо VPN (страна {d_loc}, ответ {d_code or d_err}), "
+                      f"а через туннель всё работает (страна {s_loc}): {why}", lines)
+    if s_code is not None:
+        return ClaudeDiagnosis(
+            "region", f"Claude не пускает и через VPN: сервер выходит в стране {s_loc} "
+                      f"(ответ {s_code}) — нужен сервер в другой стране", lines)
+    if d_code is None and s_code is None:
+        return ClaudeDiagnosis("socks_down", f"{host} недоступен ни напрямую, ни через VPN", lines)
+    return ClaudeDiagnosis("socks_down", f"туннель не отвечает ({s_err}), напрямую {d_code}", lines)
+
+
+def fix_claude(cfg: dict, happ: Happ, state: dict, *, echo: bool = False) -> ClaudeDiagnosis:
+    """Попытаться вернуть Claude: переподключить VPN и, если надо, поднять TUN.
+
+    Сторож меняет только то, что ему доступно: переподключение через deeplink,
+    перезапуск Happ и (если разрешено) демона happd, который запускает sing-box.
+    Страну выхода или режим TUN в интерфейсе Happ он не переключает — об этом
+    честно говорит и шлёт уведомление.
+    """
+    def say(msg: str, level: str = "info") -> None:
+        log(f"Claude: {msg}", level=level, echo=echo)
+
+    diag = diagnose_claude(cfg)
+    for line in diag.lines:
+        say(line)
+    say(diag.explanation, "ok" if diag.verdict == "ok" else "warn")
+    state["claude_fix_at"] = time.time()
+    if diag.verdict in ("ok", "unknown") or happ.stop.is_set():
+        return diag
+
+    if diag.verdict == "region":
+        steps = [("переподключение — Happ может выбрать другой сервер", "cycle")]
+    elif diag.verdict == "bypass":
+        steps = [("переподключение, чтобы поднялся TUN", "cycle")]
+        if cfg["recovery"]["allow_gui_restart"]:
+            steps.append(("перезапуск Happ, чтобы поднялся TUN", "gui"))
+        if cfg["recovery"]["allow_daemon_restart"]:
+            steps.append(("перезапуск демона happd (он запускает sing-box)", "daemon"))
+    else:
+        steps = [("переподключение VPN", "cycle")]
+
+    for title, kind in steps:
+        say(f"пробую: {title}", "warn")
+        if kind == "cycle":
+            happ.disconnect()
+            happ.stop.wait(3)
+            happ.connect()
+        elif kind == "gui":
+            happ.disconnect()
+            happ.stop.wait(2)
+            happ.kill_gui()
+            happ.start_gui()
+            happ.stop.wait(2)
+            happ.connect()
+        else:
+            happ.restart_daemon()
+            happ.stop.wait(2)
+            happ.connect()
+        deadline = time.monotonic() + float(cfg["general"]["verify_timeout"])
+        after = diag
+        while time.monotonic() < deadline:
+            if happ.stop.wait(min(5.0, max(0.1, deadline - time.monotonic()))):
+                return diag
+            after = diagnose_claude(cfg)
+            if after.verdict == "ok":
+                say(f"починено после «{title}»: {after.explanation}", "ok")
+                if cfg["general"]["notify"]:
+                    notify("Happ: Claude снова доступен", title)
+                return after
+        diag = after
+        say(f"после «{title}» не помогло: {diag.explanation}", "warn")
+
+    hint = {
+        "bypass": "включите в Happ режим TUN (системный VPN) и переподключитесь; "
+                  "если sing-box не стартует — sudo systemctl restart "
+                  f"{cfg['recovery']['daemon_service']}",
+        "region": "выберите в Happ сервер в другой стране (не RU/CN/IR/BY и т.п.)",
+    }.get(diag.verdict, "смотрите happ-watchdog doctor")
+    say(f"сам не справился, нужно вручную: {hint}", "error")
+    if cfg["general"]["notify"]:
+        notify("Happ: Claude отвечает 403", f"{diag.explanation[:120]}\n{hint}", urgency="critical")
+    return diag
 
 
 def check_happ_logs(cfg: dict) -> Check:
@@ -2540,6 +2731,86 @@ def cmd_stats(cfg: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+def log_checks(health: Health) -> None:
+    """Подробный журнал: каждая проверка цикла с задержкой и деталями."""
+    for ch in health.checks:
+        mark = "OK" if ch.ok else ("СБОЙ" if ch.critical else "СБОЙ (некрит.)")
+        lat = f" {ch.ms:.0f} ms" if ch.ms is not None else ""
+        log(f"  {ch.name}: {mark}{lat} — {ch.detail}",
+            level="info" if ch.ok else "warn")
+
+
+def claude_failed(cfg: dict, health: Health) -> bool:
+    host = cfg["claude"]["host"]
+    return any(ch.name.startswith(f"{host} ") and not ch.ok for ch in health.checks)
+
+
+def cmd_fix_claude(cfg: dict, args: argparse.Namespace) -> int:
+    print(c(f"\n  Claude ({cfg['claude']['host']}) — разбор и починка\n", "bold"))
+    if args.dry_run:
+        diag = diagnose_claude(cfg)
+        for line in diag.lines:
+            print("    " + line)
+        print("\n  " + c(diag.explanation, "green" if diag.verdict == "ok" else "yellow") + "\n")
+        return 0 if diag.verdict == "ok" else 1
+    state = load_state()
+    diag = fix_claude(cfg, Happ(cfg), state, echo=True)
+    save_state(state)
+    print()
+    return 0 if diag.verdict == "ok" else 1
+
+
+def happ_log_files() -> list[Path]:
+    names = ("application_log.txt", "core_log.txt", "tun_log.txt",
+             "subscription_log.txt", "push_log.txt")
+    return [HAPP_LOG_DIR / n for n in names if (HAPP_LOG_DIR / n).exists()]
+
+
+def cmd_logs(cfg: dict, args: argparse.Namespace) -> int:
+    """Журнал сторожа и (по --happ) логи самого Happ — целиком или хвостом, с -f вживую."""
+    files = [LOG_PATH] + (happ_log_files() if args.happ else [])
+    colors = {"ERROR": "red", "WARN": "yellow", "OK": "green"}
+
+    def show(path: Path, line: str) -> None:
+        m = LOG_LINE_RE.match(line)
+        prefix = "" if path == LOG_PATH else c(f"[{path.stem}] ", "cyan")
+        print(prefix + (c(line, colors[m.group(2)]) if m and m.group(2) in colors else line),
+              flush=True)
+
+    for path in files:
+        if path != LOG_PATH:
+            print(c(f"\n── {path} ──", "bold"))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            print(c(f"  нет файла {path}", "grey"))
+            continue
+        for line in (lines if args.lines == 0 else lines[-args.lines:]):
+            show(path, line)
+    if not args.follow:
+        return 0
+
+    print(c("\n── дальше вживую, Ctrl+C — выход ──", "grey"), flush=True)
+    offsets = {p: (p.stat().st_size if p.exists() else 0) for p in files}
+    while True:
+        for path in files:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size < offsets[path]:
+                offsets[path] = 0                 # файл ротировали
+            if size == offsets[path]:
+                continue
+            with path.open("rb") as fh:
+                fh.seek(offsets[path])
+                chunk = fh.read()
+            offsets[path] += len(chunk)
+            for line in chunk.decode("utf-8", "replace").splitlines():
+                show(path, line)
+        time.sleep(1)
+
+
 def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     try:
         lock = acquire_run_lock()
@@ -2566,6 +2837,7 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     startup_grace = float(cfg["general"]["startup_grace"])
     ping_interval = float(cfg["servers"]["ping_interval"])
     quiet = bool(cfg["general"]["quiet_when_healthy"])
+    verbose = bool(cfg["general"]["verbose"] or getattr(args, "verbose", False))
 
     if cfg["killswitch"]["enabled"]:
         killswitch_apply(cfg)
@@ -2641,6 +2913,8 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
 
         health = run_health(cfg)
         state["last_check"] = time.time()
+        if verbose:
+            log_checks(health)
 
         if health.uplink_down:
             fails = 0
@@ -2683,6 +2957,21 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
                 recovery.perform(health.reason())
                 treated += time.monotonic() - t0
                 fails = 0
+
+        # 403 от Claude не валит здоровье (проба некритична), но и не должен
+        # висеть молча. Лечим только когда обычное восстановление не занято:
+        # туннель здоров или лестница только что отработала, — иначе два
+        # лекаря дёргали бы Happ наперегонки.
+        if (cfg["claude"]["autofix"] and fails == 0 and not health.uplink_down
+                and status != "запуск Happ" and claude_failed(cfg, health)
+                and time.time() - state.get("claude_fix_at", 0)
+                >= float(cfg["claude"]["cooldown"])):
+            t0 = time.monotonic()
+            try:
+                fix_claude(cfg, happ, state)
+            except Exception as exc:  # noqa: BLE001 — сторож не должен падать из-за этого
+                log(f"лечение Claude не удалось: {type(exc).__name__}: {exc}", level="warn")
+            treated += time.monotonic() - t0
 
         last_status = status
         state["last_status"] = status
@@ -2832,6 +3121,8 @@ def main() -> int:
         "status": (cmd_status, "состояние сторожа"),
         "stats": (cmd_stats, "сводка по журналу (например: stats 24h)"),
         "doctor": (cmd_doctor, "один отчёт обо всём сразу для разбора поломки"),
+        "logs": (cmd_logs, "полный журнал сторожа (и Happ с --happ), -f — вживую"),
+        "fix-claude": (cmd_fix_claude, "разобрать и починить 403 от Claude (api.anthropic.com)"),
         "killswitch": (cmd_killswitch, "не выпускать трафик мимо туннеля (on/off/show/status)"),
         "pause": (cmd_pause, "не вмешиваться какое-то время (например: pause 30m)"),
         "resume": (cmd_resume, "снять паузу"),
@@ -2847,6 +3138,19 @@ def main() -> int:
             parser_sub.add_argument("action", nargs="?", default="status",
                                     choices=["on", "off", "show", "status"],
                                     help="on — включить, off — снять, show — показать правила")
+        if name == "run":
+            parser_sub.add_argument("-v", "--verbose", action="store_true",
+                                    help="писать в журнал каждую проверку каждого цикла")
+        if name == "logs":
+            parser_sub.add_argument("-n", "--lines", type=int, default=200,
+                                    help="сколько последних строк (0 — весь файл)")
+            parser_sub.add_argument("-f", "--follow", action="store_true",
+                                    help="продолжать выводить новые строки")
+            parser_sub.add_argument("--happ", action="store_true",
+                                    help="добавить логи Happ: ядро, tun, приложение, подписки")
+        if name == "fix-claude":
+            parser_sub.add_argument("--dry-run", action="store_true",
+                                    help="только разбор, ничего не трогать")
         if name == "stats":
             parser_sub.add_argument("period", nargs="?", default="24h",
                                     help="за какой срок: 2h, 24h, 7d (по умолчанию 24h)")

@@ -349,3 +349,4 @@ journalctl --user -u happ-watchdog -f
 ## Коды возврата `check`
 
 `0` здоров · `1` сбой · `3` нет физической сети
+# happ-watchdog
